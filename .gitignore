@@ -1,0 +1,3 @@
+# written by tools/collect.mjs on GitHub Actions and deployed with the site, never committed
+data/live/
+node_modules/

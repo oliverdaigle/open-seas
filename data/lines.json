@@ -1,0 +1,142 @@
+{
+ "royal-caribbean": {
+  "name": "Royal Caribbean",
+  "color": "#3aa0ff",
+  "currency": "USD",
+  "cabin": "Interior",
+  "book": "https://www.royalcaribbean.com/cruises?search=ship:{code}|startDate:{date}~{date}"
+ },
+ "carnival": {
+  "name": "Carnival Cruise Line",
+  "color": "#ff4d5e",
+  "currency": "USD",
+  "cabin": "Interior",
+  "book": "https://www.carnival.com/cruise-search"
+ },
+ "norwegian": {
+  "name": "Norwegian Cruise Line",
+  "color": "#4f7dff",
+  "currency": "USD",
+  "cabin": "Inside",
+  "book": "https://www.ncl.com/vacations"
+ },
+ "msc": {
+  "name": "MSC Cruises",
+  "color": "#8fa6ff",
+  "currency": "USD",
+  "cabin": "Interior",
+  "book": "https://www.msccruisesusa.com/"
+ },
+ "princess": {
+  "name": "Princess Cruises",
+  "color": "#6fd3ff",
+  "currency": "USD",
+  "cabin": "Interior",
+  "book": "https://www.princess.com/cruise-search/"
+ },
+ "celebrity": {
+  "name": "Celebrity Cruises",
+  "color": "#c8d6e8",
+  "currency": "USD",
+  "cabin": "Inside",
+  "book": "https://www.celebritycruises.com/cruises?search=ship:{code}|startDate:{date}~{date}"
+ },
+ "holland-america": {
+  "name": "Holland America Line",
+  "color": "#ff9d42",
+  "currency": "USD",
+  "cabin": "Interior",
+  "book": "https://www.hollandamerica.com/en/us/find-a-cruise"
+ },
+ "disney": {
+  "name": "Disney Cruise Line",
+  "color": "#ffd54a",
+  "currency": "USD",
+  "cabin": "Inside",
+  "book": "https://disneycruise.disney.go.com/cruises-destinations/list/"
+ },
+ "virgin": {
+  "name": "Virgin Voyages",
+  "color": "#ff3b6b",
+  "currency": "USD",
+  "cabin": "Insider",
+  "book": "https://www.virginvoyages.com/book/voyage-planner/find-a-voyage"
+ },
+ "viking": {
+  "name": "Viking",
+  "color": "#e9e2d0",
+  "currency": "USD",
+  "cabin": "Veranda",
+  "book": "https://www.vikingcruises.com/oceans"
+ },
+ "cunard": {
+  "name": "Cunard",
+  "color": "#ff7a5c",
+  "currency": "USD",
+  "cabin": "Britannia Inside",
+  "book": "https://www.cunard.com/en-us/find-a-cruise"
+ },
+ "costa": {
+  "name": "Costa Cruises",
+  "color": "#ffe45e",
+  "currency": "EUR",
+  "cabin": "Interior",
+  "book": "https://www.costacruises.com/cruises.html"
+ },
+ "aida": {
+  "name": "AIDA Cruises",
+  "color": "#ff8fb1",
+  "currency": "EUR",
+  "cabin": "Innenkabine",
+  "book": "https://aida.de/"
+ },
+ "oceania": {
+  "name": "Oceania Cruises",
+  "color": "#b9a7ff",
+  "currency": "USD",
+  "cabin": "Veranda",
+  "book": "https://www.oceaniacruises.com/cruise-finder"
+ },
+ "regent": {
+  "name": "Regent Seven Seas",
+  "color": "#d9b8ff",
+  "currency": "USD",
+  "cabin": "Veranda Suite",
+  "book": "https://www.rssc.com/cruises"
+ },
+ "silversea": {
+  "name": "Silversea",
+  "color": "#a8f0e0",
+  "currency": "USD",
+  "cabin": "Vista Suite",
+  "book": "https://www.silversea.com/find-a-cruise.html"
+ },
+ "seabourn": {
+  "name": "Seabourn",
+  "color": "#7fe3c4",
+  "currency": "USD",
+  "cabin": "Ocean View Suite",
+  "book": "https://www.seabourn.com/en/us/find-a-cruise"
+ },
+ "explora": {
+  "name": "Explora Journeys",
+  "color": "#f3c98b",
+  "currency": "USD",
+  "cabin": "Ocean Terrace Suite",
+  "book": "https://explorajourneys.com/"
+ },
+ "ritz-carlton": {
+  "name": "Ritz-Carlton Yacht Collection",
+  "color": "#ffffff",
+  "currency": "USD",
+  "cabin": "Terrace Suite",
+  "book": "https://www.ritzcarltonyachtcollection.com/voyages"
+ },
+ "p-and-o": {
+  "name": "P&O Cruises",
+  "color": "#5ee0ff",
+  "currency": "GBP",
+  "cabin": "Inside",
+  "book": "https://www.pocruises.com/find-a-cruise"
+ }
+}
