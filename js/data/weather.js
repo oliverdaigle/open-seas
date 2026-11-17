@@ -157,7 +157,8 @@ export class Weather {
         if (Array.isArray(j.activeStorms) && Date.now() - Date.parse(j.fetchedAt) < 24 * HOUR) { list = parse(j.activeStorms); at = Date.parse(j.fetchedAt); how = `Collected ${ago(at)}.`; }
       } catch {}
     }
-    if (!list) { this.liveStorms = null; setSource('storms', 'demo', 'NHC feed unreachable. Showing one simulated storm, clearly labelled.'); return; }
+    this._st = null;                 // drop storms cached before the feed answered
+    if (!list) { this.liveStorms = null; setSource('storms', 'demo', 'NHC feed unreachable. Showing one simulated storm, clearly labelled.'); this.emit(); return; }
     this.liveStorms = list;
     setSource('storms', 'live', `${how} ${list.length ? `${list.length} active: ${list.map((st) => st.name).join(', ')}. Cones are projected from current motion, not the official NHC cone.` : 'No active tropical cyclones in the Atlantic or eastern Pacific.'}`, at);
     this.emit();
