@@ -38,7 +38,7 @@ function silhouette(ship, color) {
 }
 
 export function renderShipPanel(app, ship) {
-  const line = app.lines[ship.line], site = lineSite(line), info = app.ais.info.get(ship.id) || {};
+  const line = app.lines[ship.line], site = lineSite(line), info = app.ais.info.get(ship.id) || {}, facts = app.ais.facts.get(ship.id) || {};
   const sisters = app.fleet.ships.filter((o) => o.line === ship.line && o.class === ship.class && o.id !== ship.id);
   el().innerHTML = `
     <div class="p-head">
@@ -79,7 +79,7 @@ export function renderShipPanel(app, ship) {
     <div class="p-sec"><h3>Ship</h3>
       <dl class="spec">
         <div><dt>Built</dt><dd>${ship.year}</dd></div><div><dt>Tonnage</dt><dd>${num(ship.gt)} GT</dd></div><div><dt>Guests</dt><dd>${num(ship.pax)}</dd></div>
-        <div><dt>Length</dt><dd>${ship.length} m</dd></div><div><dt>Flag</dt><dd>${esc(ship.flag)}</dd></div><div><dt>IMO</dt><dd>${ship.imo || 'not on file'}</dd></div>
+        <div><dt>Length</dt><dd>${ship.length} m</dd></div><div><dt>Flag</dt><dd>${esc(ship.flag)}</dd></div><div><dt>IMO</dt><dd>${ship.imo || facts.imo || 'not on file'}</dd></div>
         <div><dt>Class</dt><dd>${esc(ship.class)}</dd></div><div><dt>MMSI</dt><dd>${info.mmsi || '–'}</dd></div><div><dt>Matched by</dt><dd>${info.by === 'imo' ? 'IMO number' : info.by === 'type' ? 'name + type' : info.by === 'name' ? 'name' : '–'}</dd></div>
       </dl>
       ${sisters.length ? `<h3 style="margin-top:14px">Sister ships</h3><div class="chips">${sisters.map((o) => `<button type="button" data-ship="${o.id}">${esc(o.name)}</button>`).join('')}</div>` : ''}
@@ -90,16 +90,18 @@ export function renderShipPanel(app, ship) {
 }
 
 // A small map of the track sailed (amber), where the ship is (cyan) and where it is going (dashed).
-function drawMinimap(app, ship, s, dest) {
+function drawMinimap(app, ship, s, dest, lane) {
   const cv = $('.minimap', el()); if (!cv) return;
   const c = cv.getContext('2d'), W = cv.width, H = cv.height, raw = app.ais.trackUntil(ship.id, app.time.t);
-  if (s.status) raw.push([s.lat, s.lon]);
+  if (s.status && s.est !== 'route') raw.push([s.lat, s.lon]);
+  if (s.status && s.est === 'route' && !raw.length) raw.push([s.lat, s.lon]);
   if (!raw.length) { cv.hidden = true; return; } cv.hidden = false;
   const pts = []; let prev = null;
   const unwrap = (lon) => { if (prev !== null) { while (lon - prev > 180) lon -= 360; while (lon - prev < -180) lon += 360; } prev = lon; return lon; };
   for (const p of raw.length > 1 ? densify(raw, 2) : raw) pts.push([p[0], unwrap(p[1])]);
-  const end = pts[pts.length - 1], d = dest && dest.lat !== undefined ? [dest.lat, unwrap(dest.lon)] : null;
-  const all = d ? [...pts, d] : pts;
+  const here = s.status ? [s.lat, unwrap(s.lon)] : pts[pts.length - 1], d = dest && dest.lat !== undefined ? [dest.lat, unwrap(dest.lon)] : null;
+  prev = here[1]; const way = lane ? lane.map(([la, lo]) => [la, unwrap(lo)]) : d && s.status ? [here, d] : null;
+  const all = [...pts, here, ...(way || []), ...(d ? [d] : [])];
   let la0 = 90, la1 = -90, lo0 = 1e9, lo1 = -1e9; for (const [la, lo] of all) { la0 = Math.min(la0, la); la1 = Math.max(la1, la); lo0 = Math.min(lo0, lo); lo1 = Math.max(lo1, lo); }
   let spanLa = Math.max(3, (la1 - la0) * 1.4), spanLo = Math.max(6, (lo1 - lo0) * 1.3); if (spanLo < spanLa * 2) spanLo = spanLa * 2; else spanLa = spanLo / 2;
   const cLa = (la0 + la1) / 2, cLo = (lo0 + lo1) / 2, L0 = cLo - spanLo / 2, T0 = Math.min(90, cLa + spanLa / 2);
@@ -114,7 +116,7 @@ function drawMinimap(app, ship, s, dest) {
   c.globalCompositeOperation = 'multiply'; c.fillStyle = 'rgb(24,58,92)'; c.fillRect(0, 0, W, H);
   c.globalCompositeOperation = 'lighten'; c.fillStyle = 'rgb(16,22,30)'; c.fillRect(0, 0, W, H);
   c.globalCompositeOperation = 'source-over'; c.lineJoin = 'round';
-  if (d && s.status) { c.strokeStyle = '#5fd4e6'; c.lineWidth = 2.5; c.setLineDash([10, 8]); c.beginPath(); c.moveTo(X(end[1]), Y(end[0])); c.lineTo(X(d[1]), Y(d[0])); c.stroke(); c.setLineDash([]); }
+  if (way) { c.strokeStyle = '#5fd4e6'; c.lineWidth = 2.5; c.setLineDash([10, 8]); c.beginPath(); way.forEach(([la, lo], i) => (i ? c.lineTo(X(lo), Y(la)) : c.moveTo(X(lo), Y(la)))); c.stroke(); c.setLineDash([]); }
   if (pts.length > 1) { c.strokeStyle = '#ffb547'; c.lineWidth = 3; c.beginPath(); pts.forEach(([la, lo], i) => (i ? c.lineTo(X(lo), Y(la)) : c.moveTo(X(lo), Y(la)))); c.stroke(); }
   c.font = '500 19px "Spline Sans Mono", ui-monospace, monospace'; c.textBaseline = 'middle';
   const label = (la, lo, text) => {
@@ -123,14 +125,14 @@ function drawMinimap(app, ship, s, dest) {
     c.fillStyle = 'rgba(2,8,16,0.75)'; c.fillRect(right ? x + 7 : x - 11 - tw, y - 12, tw + 6, 24); c.fillStyle = '#e7eef7'; c.fillText(text, right ? x + 10 : x - 8 - tw, y + 1);
   };
   const seen = new Set();
-  for (const call of app.ais.calls.get(ship.id) || []) { if (call.from > app.time.t || seen.has(call.name)) continue; seen.add(call.name); prev = end[1]; label(call.lat, unwrap(call.lon), shortPort(call.name)); }
+  for (const call of app.ais.calls.get(ship.id) || []) { if (call.from > app.time.t || seen.has(call.name)) continue; seen.add(call.name); prev = here[1]; label(call.lat, unwrap(call.lon), shortPort(call.name)); }
   if (d) label(d[0], d[1], shortPort(dest.name));
-  if (s.status) { c.fillStyle = '#5fd4e6'; c.strokeStyle = '#02040a'; c.lineWidth = 3; c.beginPath(); c.arc(X(end[1]), Y(end[0]), 8, 0, 7); c.fill(); c.stroke(); }
+  if (s.status) { c.fillStyle = s.src === SRC.LIVE ? '#5fd4e6' : '#ffb547'; c.strokeStyle = '#02040a'; c.lineWidth = 3; c.beginPath(); c.arc(X(here[1]), Y(here[0]), 8, 0, 7); c.fill(); c.stroke(); }
 }
 
 const arrived = (s, v) => s.status === PORT && v?.port?.lat !== undefined && distNm(s.lat, s.lon, v.port.lat, v.port.lon) < 6;
 
-function voyageHtml(app, ship, s) {
+function voyageHtml(app, ship, s, lane) {
   const v = app.ais.voyages.get(ship.id), t = app.time.t, real = Date.now();
   if (!v) return `<p class="note" style="margin:0">${s.status ? 'This ship hasn’t broadcast a destination since the site started listening. Ships repeat it every 6 minutes, so it usually appears within a few collections.' : 'Not heard on AIS yet.'}</p>`;
   const p = v.port, rows = [];
@@ -139,12 +141,15 @@ function voyageHtml(app, ship, s) {
   const dl = [];
   if (arrived(s, v)) rows.push(`<p class="note" style="margin:0 0 10px">Alongside at its broadcast destination now. The crew usually sets the next port when the ship sails.</p>`);
   if (v.eta) dl.push(`<div><dt>${arrived(s, v) ? 'Arrived (ETA)' : 'ETA'}</dt><dd style="font-size:13px">${esc(fmtDate(v.eta))}${v.etaTimeKnown ? ` ${fmtTime(v.eta)} UTC` : ''}<br><small>${esc(relative(v.eta, real))}</small></dd></div>`);
-  if (p && p.lat !== undefined && s.status && !arrived(s, v) && Math.abs(t - real) < 6 * HOUR) {
+  if (lane) dl.push(`<div><dt>To go</dt><dd style="font-size:13px">${num(lane.left)} nm<br><small>by the shipping lane</small></dd></div>`);
+  else if (p && p.lat !== undefined && s.status && !arrived(s, v) && Math.abs(t - real) < 6 * HOUR) {
     const nm = distNm(s.lat, s.lon, p.lat, p.lon), hrs = s.sog > 3 ? nm / s.sog : null;
     dl.push(`<div><dt>Distance</dt><dd style="font-size:13px">${num(nm)} nm${hrs ? `<br><small>about ${hrs < 48 ? `${Math.round(hrs)} h` : `${(hrs / 24).toFixed(1)} days`} at ${s.sog.toFixed(0)} kn</small>` : ''}</dd></div>`);
   }
   if (v.draught) dl.push(`<div><dt>Draught</dt><dd style="font-size:13px">${v.draught.toFixed(1)} m</dd></div>`);
   if (dl.length) rows.push(`<dl class="readout">${dl.join('')}</dl>`);
+  if (s.est === 'route') rows.push(`<p class="note">Out of range of AIS receivers since its last report ${esc(ago(s.seen))}. The position is estimated along the shipping lane to ${esc(shortPort(p?.name || v.dest))}, timed ${s.arr?.how === 'eta' ? 'to arrive at the ETA the ship broadcast' : `at its last reported speed of ${Math.round(s.arr?.kn || s.sog)} kn`}. It snaps to the real position when AIS hears it again.</p>`);
+  else if (s.est === 'arrived') rows.push(`<p class="note">Estimated to have reached ${esc(shortPort(p?.name || v.dest))} ${esc(ago(s.arr.t))}${s.arr.how === 'eta' ? ', at the ETA the ship broadcast' : ''}. AIS last heard it ${esc(ago(s.seen))}. It moves again when AIS next hears it.</p>`);
   rows.push(`<p class="note">The crew enters the destination and ETA into the ship’s AIS transponder. It is the ship’s own word, usually the next port of call.</p>`);
   return rows.join('');
 }
@@ -171,7 +176,8 @@ export function updateShipPanel(app, force) {
   const b = [];
   if (!s.status) b.push('<span class="badge warn">Not heard on AIS yet</span>');
   else {
-    b.push(`<span class="badge ${s.src === SRC.LIVE ? 'live' : s.src === SRC.LAST ? 'warn' : ''}">${SRC_LABEL[s.src]} AIS position</span><span class="badge">Heard ${esc(ago(s.seen))}</span>`);
+    const label = { [SRC.LIVE]: 'Live AIS position', [SRC.ESTIMATED]: 'Estimated position', [SRC.RECENT]: 'Last reported position', [SRC.RECORDED]: 'Recorded AIS position', [SRC.LAST]: 'Last known position' }[s.src];
+    b.push(`<span class="badge ${s.src === SRC.LIVE ? 'live' : s.src === SRC.LAST ? 'warn' : ''}">${label}</span><span class="badge">Last AIS report ${esc(ago(s.seen))}</span>`);
     b.push(`<span class="badge">${esc(NAV[s.nav] || (s.status === PORT ? 'Stopped' : 'Under way'))}</span>`);
   }
   f('badges').innerHTML = b.join('');
@@ -182,12 +188,13 @@ export function updateShipPanel(app, force) {
   $('[data-f="next"]', p).previousElementSibling.textContent = arrived(s, v) ? 'At' : 'Heading to';
   f('next').innerHTML = v ? `${esc(v.port && !v.port.unresolved ? shortPort(v.port.name) : v.dest || '–')}${v.eta ? `<br><small>ETA ${esc(fmtDate(v.eta))}${v.etaTimeKnown ? ` ${fmtTime(v.eta)} UTC` : ''}</small>` : ''}` : '<small>not broadcast yet</small>';
   // the slower sections only when something they show has changed
-  const key = `${Math.floor(t / (10 * 6e4))}:${app.ais.lastSeen(ship.id)}:${v?.at || 0}:${s.status}`;
+  const key = `${Math.floor(t / (5 * 6e4))}:${app.ais.lastSeen(ship.id)}:${v?.at || 0}:${s.status}:${s.est || ''}`;
   if (force || key !== p._key) {
     p._key = key;
-    f('voyage').innerHTML = voyageHtml(app, ship, s);
+    const lane = app.ais.ahead(ship.id, t, s.status ? s : null);
+    f('voyage').innerHTML = voyageHtml(app, ship, s, lane);
     f('history').innerHTML = historyHtml(app, ship);
-    drawMinimap(app, ship, s, v?.port && Math.abs(t - real) < 6 * HOUR ? v.port : null);
+    drawMinimap(app, ship, s, v?.port && (lane || Math.abs(t - real) < 6 * HOUR) ? v.port : null, lane?.path);
   }
   if (s.status && Math.abs(t - p._wxT) > 45 * 6e4) {
     p._wxT = t; const token = (p._wxTok = Math.random());

@@ -3,9 +3,10 @@
 //                        position pings, the destination and ETA each ship broadcasts, detected port calls
 //   CONFIG.AIS_PROXY_URL optional real-time relay, merged in when set
 //   IndexedDB            every ping this browser has seen, so the timeline can replay further back
-// A ship AIS has not heard is not drawn. Nothing is simulated.
+// A ship AIS has not heard is not drawn. Between reports a ship that broadcast a destination is placed along
+// the shipping-lane route there (worked out by the collector), timed to its broadcast ETA.
 import { CONFIG } from '../config.js';
-import { destination, gcPoint, distNm } from '../geo.js';
+import { destination, gcPoint, distNm, bearing } from '../geo.js';
 import { getJSON, setSource } from './sources.js';
 import { REC, TRAIL, PORT, SEA } from '../fleet.js';
 
@@ -18,7 +19,7 @@ export const stopped = (p) => p.nav === 5 || p.nav === 1 || p.sog < 0.6;
 
 export class AIS {
   constructor(fleet) {
-    this.fleet = fleet; this.tracks = new Map(); this.voyages = new Map(); this.calls = new Map(); this.info = new Map();
+    this.fleet = fleet; this.tracks = new Map(); this.voyages = new Map(); this.calls = new Map(); this.info = new Map(); this.est = new Map(); this.facts = new Map();
     this.byMmsi = new Map(); this.byName = new Map(); this.byImo = new Map(); this.portCache = new Map();
     this.generatedAt = 0; this.ws = null; this.db = null; this.retry = 2000;
     for (const s of fleet.ships) { this.byName.set(norm(s.name), s); if (s.imo) this.byImo.set(s.imo, s); }
@@ -44,15 +45,17 @@ export class AIS {
       this.info.set(id, { mmsi: d.mmsi, by: d.by });
       if (d.voyage) this.voyages.set(id, d.voyage);
       if (d.calls) this.calls.set(id, d.calls);
+      if (d.ais) this.facts.set(id, d.ais);
+      if (d.est?.path?.length > 1) { const cum = [0]; for (let i = 1; i < d.est.path.length; i++) cum.push(cum[i - 1] + distNm(...d.est.path[i - 1], ...d.est.path[i])); this.est.set(id, { ...d.est, cum, total: cum[cum.length - 1] }); }
+      else this.est.delete(id);
       this.addPings(id, (d.track || []).map(([t, lat, lon, sog, cog, hdg, nav]) => ({ t, lat, lon, sog, cog, hdg, nav })), true);
     }
-    const { live, week, total } = this.counts();
-    if (j.status !== 'ok' && !week) { setSource('ais', j.status === 'no-key' ? 'waiting' : 'error', j.error || 'The last collection failed.', at); return false; }
+    if (j.status !== 'ok' && !this.tracks.size) { setSource('ais', j.status === 'no-key' ? 'waiting' : 'error', j.error || 'The last collection failed.', at); return false; }
     setSource('ais', j.status === 'ok' ? 'live' : 'error',
-      `${j.status === 'ok' ? '' : `${j.error || 'The last collection failed'}. `}${live} of ${total} ships heard in the last hour, ${week} in the last week. AIS is picked up by coastal receivers, so ships far offshore are shown at their last known position until they are heard again.`, at);
+      `${j.status === 'ok' ? '' : `${j.error || 'The last collection failed'}. `}Coastal receivers hear ships near land. Between reports, a ship that broadcast a destination is placed along the shipping lane to it, timed to its ETA; others are held at their last reported position.`, at);
     setSource('voyages', this.voyages.size ? 'live' : 'waiting', this.voyages.size
-      ? `${this.voyages.size} ships have broadcast a destination. The crew types it into the ship's AIS, so it is the ship's own word on where it is going.`
-      : 'No ship has broadcast its destination yet. Ships send it every 6 minutes.', at);
+      ? 'The crew types the destination and ETA into the ship’s AIS, so it is the ship’s own word on where it is going.'
+      : 'No destinations received yet. Ships send them every 6 minutes.', at);
     return true;
   }
   addPings(id, pings, persist) {
@@ -100,11 +103,42 @@ export class AIS {
       return { lat: p[0], lon: p[1], hdg: a.hdg, sog: a.sog + (b.sog - a.sog) * f, cog: a.cog, nav: a.nav, src: now - t < 10 * MIN ? SRC.LIVE : SRC.RECORDED, seen: a.t };
     }
     const age = t - a.t; if (age > 30 * DAY) return null;
+    const e = !b && this.est.get(id);
+    if (e && e.from === a.t && !stopped(a) && age > 5 * MIN) {        // along the lane to its broadcast destination
+      const arr = this.arrival(id, a, e);
+      if (t < arr.t) {
+        const q = this.along(e, (t - a.t) / (arr.t - a.t));
+        return { lat: q.lat, lon: q.lon, hdg: q.hdg, cog: q.hdg, sog: e.total / ((arr.t - a.t) / HOUR), nav: 0, src: SRC.ESTIMATED, seen: a.t, est: 'route', arr };
+      }
+      const end = e.path[e.path.length - 1];
+      return { lat: end[0], lon: end[1], hdg: a.hdg, cog: a.cog, sog: 0, nav: 5, src: t - arr.t < 12 * HOUR ? SRC.ESTIMATED : SRC.LAST, seen: a.t, est: 'arrived', arr };
+    }
     if (!stopped(a) && age <= 45 * MIN) {                              // shortly after a report: dead reckoning
       const p = destination(a.lat, a.lon, a.cog, a.sog * age / HOUR);
       return { lat: p[0], lon: p[1], hdg: a.hdg, sog: a.sog, cog: a.cog, nav: a.nav, src: age <= 5 * MIN ? SRC.LIVE : SRC.ESTIMATED, seen: a.t };
     }
     return { lat: a.lat, lon: a.lon, hdg: a.hdg, sog: a.sog, cog: a.cog, nav: a.nav, src: age <= 5 * MIN ? SRC.LIVE : age <= 6 * HOUR ? SRC.RECENT : SRC.LAST, seen: a.t };
+  }
+  // When an underway ship should reach the end of its lane route: its broadcast ETA when that is recent and
+  // plausible (4 to 30 knots over the route), otherwise at its last reported speed.
+  arrival(id, a, e) {
+    const v = this.voyages.get(id);
+    if (v?.eta && v.at >= a.t - DAY && v.eta > a.t + 10 * MIN) { const kn = e.total / ((v.eta - a.t) / HOUR); if (kn >= 4 && kn <= 30) return { t: v.eta, how: 'eta' }; }
+    return { t: a.t + (e.total / Math.max(a.sog, 8)) * HOUR, how: 'speed', kn: Math.max(a.sog, 8) };
+  }
+  // The point fraction f of the way along a lane route, with the heading there and the index of its leg.
+  along(e, f) {
+    const d = Math.max(0, Math.min(1, f)) * e.total, c = e.cum; let i = 1;
+    while (i < c.length - 1 && c[i] < d) i++;
+    const a = e.path[i - 1], b = e.path[i], seg = c[i] - c[i - 1], p = gcPoint(a, b, seg > 0 ? (d - c[i - 1]) / seg : 0);
+    return { lat: p[0], lon: p[1], hdg: bearing(a[0], a[1], b[0], b[1]), leg: i, left: e.total - d };
+  }
+  // The way still to go for the ship at time t: the rest of its lane route, or null.
+  ahead(id, t, p) {
+    const e = this.est.get(id), last = this.lastSeen(id);
+    if (!p || !e || e.from !== last || t < e.from || p.est === 'arrived' || stopped(p)) return null;
+    const a = (this.tracks.get(id) || []).at(-1), arr = this.arrival(id, a, e), q = this.along(e, (t - a.t) / (arr.t - a.t));
+    return { path: [[p.lat, p.lon], ...e.path.slice(q.leg)], left: q.left, arr };
   }
   // The fleet port (index into fleet.portCodes) a stopped ship is lying at, or -1.
   portIndex(id, p) {

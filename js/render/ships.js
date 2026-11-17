@@ -1,5 +1,5 @@
 // Ships, wakes, ports and the selected ship's track. One instanced draw call for the whole fleet.
-import { llToVec, densify, gcPoint, angle, R2D, D2R } from '../geo.js';
+import { llToVec, densify, D2R } from '../geo.js';
 import { REC, TRAIL, PORT } from '../fleet.js';
 import { SRC } from '../data/ais.js';
 
@@ -73,19 +73,17 @@ export class ShipLayer {
     this.m = new THREE.Matrix4();
   }
 
-  // The selected ship: the track it has sailed (amber) and, dashed, the way to the destination it broadcasts (cyan).
-  showTrack(track, from, dest) {
+  // The selected ship: the track it has sailed (amber) and, dashed, the way still to go to the destination it
+  // broadcasts (cyan): its lane route when there is one, else a straight line. Pass null to clear.
+  showTrack(track, ahead) {
     const pts = [];
     if (track && track.length > 1) for (const p of densify(track, 1)) pts.push(...llToVec(p[0], p[1], 1.0009));
     this.route.geometry.dispose(); this.route.geometry = new THREE.BufferGeometry();
     this.route.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3)); this.route.visible = pts.length > 0;
     const seg = [];
-    if (from && dest && dest.lat !== undefined) {
-      const deg = angle(from[0], from[1], dest.lat, dest.lon) * R2D, n = Math.max(2, Math.ceil(deg / 0.4));
-      for (let i = 0; i < n; i += 2) {
-        const a = gcPoint(from, [dest.lat, dest.lon], i / n), b = gcPoint(from, [dest.lat, dest.lon], Math.min(1, (i + 1) / n));
-        seg.push(...llToVec(a[0], a[1], 1.0009), ...llToVec(b[0], b[1], 1.0009));
-      }
+    if (ahead && ahead.length > 1) {
+      const d = densify(ahead, 0.35);
+      for (let i = 1; i < d.length; i += 2) seg.push(...llToVec(d[i - 1][0], d[i - 1][1], 1.0009), ...llToVec(d[i][0], d[i][1], 1.0009));
     }
     this.extraRoutes.geometry.dispose(); this.extraRoutes.geometry = new THREE.BufferGeometry();
     this.extraRoutes.geometry.setAttribute('position', new THREE.Float32BufferAttribute(seg, 3)); this.extraRoutes.visible = seg.length > 0;

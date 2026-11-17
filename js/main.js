@@ -108,10 +108,11 @@ const followState = {};
 function refreshTrack() {
   const ship = app.sel.ship; if (!ship) return;
   const t = app.time.t, s = app.shipState(ship), v = app.ais.voyages.get(ship.id), seen = app.ais.lastSeen(ship.id);
-  const key = `${ship.id}:${Math.floor(t / (10 * MIN))}:${seen}:${v?.at || 0}`; if (key === app.trackKey) return; app.trackKey = key;
-  const track = app.ais.trackUntil(ship.id, t); if (s.status) track.push([s.lat, s.lon]);
-  const showDest = v?.port && v.port.lat !== undefined && Math.abs(t - Date.now()) < 6 * HOUR;
-  app.ships.showTrack(track, s.status ? [s.lat, s.lon] : null, showDest ? v.port : null);
+  const key = `${ship.id}:${Math.floor(t / (2 * MIN))}:${seen}:${v?.at || 0}`; if (key === app.trackKey) return; app.trackKey = key;
+  const track = app.ais.trackUntil(ship.id, t); if (s.status && s.est !== 'route') track.push([s.lat, s.lon]);
+  const lane = app.ais.ahead(ship.id, t, s.status ? s : null);
+  const straight = !lane && s.status && v?.port?.lat !== undefined && Math.abs(t - Date.now()) < 6 * HOUR && s.status === SEA ? [[s.lat, s.lon], [v.port.lat, v.port.lon]] : null;
+  app.ships.showTrack(track, lane ? lane.path : straight);
 }
 
 // ---- line filter ----
@@ -121,8 +122,8 @@ app.applyFilter = () => {
 };
 
 // ---- ships heading into a storm's forecast cone in the next five days ----
-// Each ship is projected along the great circle to the destination it broadcasts, at its reported speed,
-// stopping there; with no destination, along its current course for two days.
+// Each ship is projected along its lane route to the destination it broadcasts, timed to its ETA, or, without
+// a route, along the great circle to that destination at its reported speed, or along its course for two days.
 function findAlerts() {
   app.alerts.clear(); const storms = app.fx.storms; app.ships.alerts = app.alerts; if (!storms.length) return;
   const o = {};
@@ -131,6 +132,7 @@ function findAlerts() {
     const v = app.ais.voyages.get(ship.id), dest = v?.port?.lat !== undefined ? v.port : null, sp = Math.max(s.sog, s.status === SEA ? 8 : 0);
     const total = dest ? distNm(s.lat, s.lon, dest.lat, dest.lon) : 0;
     const at = (h) => {
+      const q = app.ais.positionAt(ship.id, app.time.t + h * HOUR); if (q?.est) return [q.lat, q.lon];
       if (dest && total > 1) return gcPoint([s.lat, s.lon], [dest.lat, dest.lon], Math.min(1, (sp * h) / total));
       return h > 48 ? null : destination(s.lat, s.lon, s.cog ?? s.hdg, sp * h);
     };

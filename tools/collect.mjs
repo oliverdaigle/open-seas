@@ -17,7 +17,7 @@ const OUT = new URL('data/live/', ROOT);
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const KEY = (process.env.AISSTREAM_API_KEY || '').trim();
 const AIS_URL = process.env.AIS_URL || 'wss://stream.aisstream.io/v0/stream';
-const LISTEN_S = Number(process.env.AIS_SECONDS || 240);
+const LISTEN_S = Number(process.env.AIS_SECONDS || 600);
 const DEBUG_AIS = !!process.env.DEBUG_AIS;
 const FORCE_WEATHER = !!process.env.FORCE_WEATHER;
 const MIN = 6e4, HOUR = 36e5;
@@ -97,13 +97,16 @@ async function storms() {
 
 // ---------------------------------------------------------------- ships (AIS)
 // ais.json, schema 2. For every ship AIS has heard in the last 30 days:
-//   track   [[t, lat, lon, sog, cog, hdg, nav], ...]  every ping from the last 24 h, one per 30 min back
-//           to 7 days, and always the newest ping (so a ship seen 3 weeks ago keeps its last position)
+//   track   [[t, lat, lon, sog, cog, hdg, nav], ...]  every ping from the last 3 h, one per 10 min back to
+//           24 h, one an hour back to 7 days, and always the newest (a ship seen weeks ago keeps its last position)
 //   voyage  what the ship itself broadcasts: destination text, the port it decodes to, ETA, draught
+//   est     the shipping-lane route from the last report to that destination, for estimating where the
+//           ship is between reports (data/marnet.json, routed here with Dijkstra)
 //   calls   port calls detected from the track (moored or stopped next to a port)
+//   ais     what the transponder says about the ship itself: IMO number, length, beam
 const norm = (s) => (s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 const PASSENGER = (type) => type >= 60 && type <= 69;
-const KEEP_ALL = 24 * HOUR, KEEP_TRACK = 7 * 864e5, KEEP_LAST = 30 * 864e5, THIN = 30 * MIN;
+const KEEP_TRACK = 7 * 864e5, KEEP_LAST = 30 * 864e5;
 const NM = 3440.065, D2R = Math.PI / 180;
 const distNm = (a, b, c, d) => {
   const p1 = a * D2R, p2 = c * D2R, h = Math.sin((p2 - p1) / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(((d - b) * D2R) / 2) ** 2;
@@ -238,11 +241,89 @@ function mergeCalls(old = [], fresh = []) {
 function thin(track, now) {
   const out = []; let lastKept = -Infinity;
   track.forEach((p, i) => {
-    const age = now - p[0], newest = i === track.length - 1;
-    if (newest ? age < KEEP_LAST : age < KEEP_ALL) { out.push(p); lastKept = p[0]; }
-    else if (age < KEEP_TRACK && p[0] - lastKept >= THIN) { out.push(p); lastKept = p[0]; }
+    const age = now - p[0], newest = i === track.length - 1, step = age < 3 * HOUR ? 0 : age < 24 * HOUR ? 10 * MIN : 60 * MIN;
+    if (newest ? age < KEEP_LAST : age < KEEP_TRACK && p[0] - lastKept >= step) { out.push(p); lastKept = p[0]; }
   });
   return out;
+}
+
+// Point f of the way along the great circle from a to b ([lat, lon]).
+function gc(a, b, f) {
+  const v = ([la, lo]) => [Math.cos(la * D2R) * Math.cos(lo * D2R), Math.cos(la * D2R) * Math.sin(lo * D2R), Math.sin(la * D2R)];
+  const p = v(a), q = v(b), w = Math.acos(Math.max(-1, Math.min(1, p[0] * q[0] + p[1] * q[1] + p[2] * q[2])));
+  if (w < 1e-9) return a;
+  const k1 = Math.sin((1 - f) * w) / Math.sin(w), k2 = Math.sin(f * w) / Math.sin(w), x = p.map((c, i) => c * k1 + q[i] * k2);
+  return [Math.asin(Math.max(-1, Math.min(1, x[2]))) / D2R, Math.atan2(x[1], x[0]) / D2R];
+}
+
+// Shortest route along the world's shipping lanes (data/marnet.json) from a ship to a port, then pulled
+// straight wherever open water allows (data/water.bin: 0.1 degree land/sea grid from the globe's own mask).
+async function seaRouter() {
+  const net = JSON.parse(await readFile(new URL('data/marnet.json', ROOT), 'utf8'));
+  const water = await readFile(new URL('data/water.bin', ROOT));
+  const wet = (lat, lon) => {
+    const r = Math.min(1799, Math.max(0, Math.floor((90 - lat) * 10))), c = ((Math.floor((lon + 180) * 10) % 3600) + 3600) % 3600, k = r * 3600 + c;
+    return (water[k >> 3] >> (7 - (k & 7))) & 1;
+  };
+  // A straight run that stays at sea, ignoring the last 4 nm at each end (ports sit on the coast).
+  const clear = (a, b) => {
+    const d = distNm(a[0], a[1], b[0], b[1]), n = Math.ceil(d / 2);
+    for (let k = 1; k < n; k++) { const f = k / n; if (d * f < 4 || d * (1 - f) < 4) continue; const p = gc(a, b, f); if (!wet(p[0], p[1])) return false; }
+    return true;
+  };
+  const straighten = (pts) => {
+    const out = [pts[0]]; let i = 0;
+    while (i < pts.length - 1) { let j = pts.length - 1; while (j > i + 1 && !clear(pts[i], pts[j])) j--; out.push(pts[j]); i = j; }
+    return out;
+  };
+  const nodes = [], index = new Map(), adj = [];
+  const node = (lon, lat) => { const k = `${lon},${lat}`; let i = index.get(k); if (i === undefined) { i = nodes.length; index.set(k, i); nodes.push([lat, lon]); adj.push([]); } return i; };
+  for (const line of net.lines) for (let j = 1; j < line.length; j++) {
+    const a = node(...line[j - 1]), b = node(...line[j]); if (a === b) continue;
+    const d = distNm(nodes[a][0], nodes[a][1], nodes[b][0], nodes[b][1]); adj[a].push([b, d]); adj[b].push([a, d]);
+  }
+  const edge = new Map();                                          // join the lanes across the antimeridian
+  nodes.forEach(([lat, lon], i) => { if (Math.abs(lon) !== 180) return; const o = edge.get(lat); if (o !== undefined) { adj[i].push([o, 0]); adj[o].push([i, 0]); } else edge.set(lat, i); });
+  // Snap only to the main connected network, never to a stray fragment of lane.
+  const comp = new Int32Array(nodes.length).fill(-1), size = [];
+  for (let i = 0; i < nodes.length; i++) {
+    if (comp[i] >= 0) continue; const c = size.length, stack = [i]; comp[i] = c; let n = 0;
+    while (stack.length) { const u = stack.pop(); n++; for (const [v] of adj[u]) if (comp[v] < 0) { comp[v] = c; stack.push(v); } }
+    size.push(n);
+  }
+  const main = size.indexOf(Math.max(...size));
+  const nearest = (lat, lon) => { let best = -1, bd = Infinity; nodes.forEach(([a, b], i) => { if (comp[i] !== main || Math.abs(a - lat) > 8) return; const d = distNm(lat, lon, a, b); if (d < bd) { bd = d; best = i; } }); return best; };
+  // Dijkstra from the destination, so every node knows its distance to it and its next step towards it.
+  function fromDest(src) {
+    const n = nodes.length, dist = new Float64Array(n).fill(Infinity), next = new Int32Array(n).fill(-1), heap = [[0, src]]; dist[src] = 0;
+    const push = (x) => { heap.push(x); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
+    const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
+    while (heap.length) { const [d, u] = pop(); if (d > dist[u]) continue; for (const [v, w] of adj[u]) if (d + w < dist[v]) { dist[v] = d + w; next[v] = u; push([dist[v], v]); } }
+    return { dist, next };
+  }
+  // Drop points that add nothing to the shape (Douglas-Peucker in degrees, never across the antimeridian).
+  const simplify = (pts, tol) => {
+    if (pts.length < 3) return pts;
+    let far = 0, fi = 0; const [a, b] = [pts[0], pts[pts.length - 1]];
+    for (let i = 1; i < pts.length - 1; i++) {
+      const p = pts[i], dx = b[1] - a[1], dy = b[0] - a[0], len = Math.hypot(dx, dy) || 1e-9;
+      const d = Math.abs(dy * (p[1] - a[1]) - dx * (p[0] - a[0])) / len + (Math.abs(p[1] - pts[i - 1][1]) > 180 ? 1e3 : 0);
+      if (d > far) { far = d; fi = i; }
+    }
+    return far <= tol ? [a, b] : [...simplify(pts.slice(0, fi + 1), tol).slice(0, -1), ...simplify(pts.slice(fi), tol)];
+  };
+  return function route(lat, lon, dlat, dlon) {
+    const direct = distNm(lat, lon, dlat, dlon);
+    const goal = nearest(dlat, dlon); if (goal < 0) return null;
+    const { dist, next } = fromDest(goal);
+    let best = -1, bd = Infinity;                                  // the lane node that gets this ship there soonest
+    nodes.forEach(([a, b], i) => { if (Math.abs(a - lat) > 3 || dist[i] === Infinity) return; const d = distNm(lat, lon, a, b); if (d > 200) return; const total = d + dist[i] + distNm(nodes[goal][0], nodes[goal][1], dlat, dlon); if (total < bd) { bd = total; best = i; } });
+    if (clear([lat, lon], [dlat, dlon]) || best < 0 || direct < 25 || bd > direct * 3) return clear([lat, lon], [dlat, dlon]) || direct < 400 ? { nm: Math.round(direct), path: [[lat, lon], [dlat, dlon]] } : null;
+    const pts = [[lat, lon]]; for (let i = best; i >= 0; i = next[i]) { pts.push(nodes[i]); if (i === goal) break; } pts.push([dlat, dlon]);
+    const path = straighten(simplify(pts, 0.03)).map(([a, b]) => [+a.toFixed(3), +b.toFixed(3)]);
+    let nm = 0; for (let i = 1; i < path.length; i++) nm += distNm(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]);
+    return { nm: Math.round(nm), path };
+  };
 }
 
 async function ais() {
@@ -262,7 +343,22 @@ async function ais() {
   const anyFor = (id) => [...mmsi.entries()].find(([, m]) => m.id === id);
   const drop = (mm) => { mmsi.delete(mm); blocked.add(mm); };
 
-  const pings = new Map(), statics = new Map(), stats = { messages: 0, positions: 0, staticReports: 0, matchedPositions: 0, emptyNames: 0 };
+  const pings = new Map(), statics = new Map(), pending = new Map(), stats = { messages: 0, positions: 0, staticReports: 0, matchedPositions: 0, emptyNames: 0, confirmed: 0, rejected: 0 };
+  const addPing = (id, p) => {
+    let list = pings.get(id); if (!list) pings.set(id, list = []);
+    const last = list[list.length - 1];
+    if (last && p[0] <= last[0] && last[7] === p[7]) return;
+    if (last && last[7] === p[7] && list.length > 1 && p[0] - list[list.length - 2][0] < 2 * MIN) list[list.length - 1] = p;
+    else list.push(p);
+    stats.matchedPositions++;
+  };
+  // A vessel found by name becomes the ship only once it confirms it carries passengers and is about the right length.
+  const accept = (mm, id, by) => {
+    for (const [k, v] of mmsi) if (v.id === id && k !== mm) mmsi.delete(k);
+    mmsi.set(mm, { id, by }); stats.confirmed++;
+    for (const p of pending.get(mm)?.pings || []) addPing(id, p);
+    pending.delete(mm);
+  };
   const dbg = new Map();
   const onMessage = (m) => {
     stats.messages++;
@@ -273,46 +369,38 @@ async function ais() {
       stats.staticReports++;
       const sd = m.Message?.ShipStaticData || {}, imo = +sd.ImoNumber || 0, type = +sd.Type || 0;
       if (DEBUG_AIS && PASSENGER(type)) dbg.set(mm, { mmsi: mm, name: String(sd.Name || meta.ShipName || '').trim(), imo, type, dest: sd.Destination });
+      const dim = sd.Dimension || {}, len = (+dim.A || 0) + (+dim.B || 0), beam = (+dim.C || 0) + (+dim.D || 0);
       const imoShip = imo && byImo.get(imo);
-      if (imoShip) {                                   // an IMO match beats any name match
-        for (const [k, v] of mmsi) if (v.id === imoShip.id && k !== mm) mmsi.delete(k);
-        mmsi.set(mm, { id: imoShip.id, by: 'imo' });
-      } else {
+      if (imoShip) accept(mm, imoShip.id, 'imo');      // an IMO match beats any name match
+      else {
         const cur = mmsi.get(mm), ship = cur ? byId.get(cur.id) : byName.get(norm(sd.Name || meta.ShipName));
         if (!ship) return;
-        if ((ship.imo && imo && imo !== ship.imo) || (type && !PASSENGER(type))) { if (cur) drop(mm); return; }   // a namesake
-        if (PASSENGER(type) && !strongFor(ship.id)) {
-          for (const [k, v] of mmsi) if (v.id === ship.id && k !== mm) mmsi.delete(k);
-          mmsi.set(mm, { id: ship.id, by: 'type' });
-        }
+        const badLength = len > 20 && ship.length && (len < ship.length * 0.8 || len > ship.length * 1.2);
+        if ((ship.imo && imo && imo !== ship.imo) || (type && !PASSENGER(type)) || badLength) { drop(mm); pending.delete(mm); stats.rejected++; return; }   // a namesake
+        if (PASSENGER(type) && !strongFor(ship.id)) accept(mm, ship.id, 'type');
       }
-      if (mmsi.has(mm)) statics.set(mm, { at: aisTime(meta.time_utc), dest: String(sd.Destination || '').trim(), eta: sd.Eta, draught: sd.MaximumStaticDraught, callSign: String(sd.CallSign || '').trim() });
+      if (mmsi.has(mm)) statics.set(mm, { at: aisTime(meta.time_utc), dest: String(sd.Destination || '').trim(), eta: sd.Eta, draught: sd.MaximumStaticDraught,
+        callSign: String(sd.CallSign || '').trim(), imo, len, beam });
       return;
     }
     if (m.MessageType !== 'PositionReport') return;
     stats.positions++;
-    let entry = mmsi.get(mm);
-    if (!entry) {
-      const ship = byName.get(norm(meta.ShipName));
-      if (!ship || anyFor(ship.id)) return;          // unknown, or the ship already has a vessel assigned
-      entry = { id: ship.id, by: 'name' }; mmsi.set(mm, entry);
-    }
+    const entry = mmsi.get(mm), named = entry ? null : byName.get(norm(meta.ShipName));
+    if (!entry && (!named || strongFor(named.id))) return;     // not one of ours, or the ship is already confirmed elsewhere
     const pr = m.Message?.PositionReport || {};
     const lat = pr.Latitude ?? meta.latitude, lon = pr.Longitude ?? meta.longitude;
     if (!(Math.abs(lat) <= 90) || !(Math.abs(lon) <= 180) || (lat === 0 && lon === 0)) return;
     const sog = pr.Sog >= 0 && pr.Sog < 102.3 ? pr.Sog : 0, cog = pr.Cog >= 0 && pr.Cog < 360 ? pr.Cog : 0;
     const hdg = pr.TrueHeading >= 0 && pr.TrueHeading < 360 ? pr.TrueHeading : cog, nav = pr.NavigationalStatus ?? 15;
     const p = [aisTime(meta.time_utc), +lat.toFixed(5), +lon.toFixed(5), +sog.toFixed(1), +cog.toFixed(1), hdg, nav, mm];
-    let list = pings.get(entry.id); if (!list) pings.set(entry.id, list = []);
-    const last = list[list.length - 1];
-    if (last && p[0] <= last[0] && last[7] === mm) return;
-    if (last && last[7] === mm && list.length > 1 && p[0] - list[list.length - 2][0] < 2 * MIN) list[list.length - 1] = p;
-    else list.push(p);
-    stats.matchedPositions++;
+    if (entry) return addPing(entry.id, p);
+    const w = pending.get(mm) || { id: named.id, pings: [] }; pending.set(mm, w);   // held until its static report confirms it
+    const last = w.pings[w.pings.length - 1]; if (!last || p[0] - last[0] >= 2 * MIN) w.pings.push(p);
   };
 
   let result = { opened: false, error: 'No AISStream key has been added to the repository yet' };
   if (KEY) { log(`AIS: listening for ${LISTEN_S} s`); result = await listen(onMessage, LISTEN_S); }
+  const end = Date.now(), route = await seaRouter();
 
   // Merge with the deployed copy. Old data survives only while its vessel is still assigned to the ship.
   const out = {};
@@ -320,7 +408,7 @@ async function ais() {
     const id = ship.id, mm = anyFor(id)?.[0], old = prevShips[id] && prevShips[id].mmsi === mm ? prevShips[id] : null;
     const fresh = (pings.get(id) || []).filter((p) => p[7] === mm).map((p) => p.slice(0, 7));
     const byT = new Map([...(old?.track || []), ...fresh].map((p) => [p[0], p]));
-    const track = thin([...byT.values()].sort((a, b) => a[0] - b[0]), now);
+    const track = thin([...byT.values()].sort((a, b) => a[0] - b[0]), end);
     if (!track.length) continue;
     const last = track[track.length - 1];
     const st = mm && statics.get(mm);
@@ -331,13 +419,20 @@ async function ais() {
         ...(st.draught > 0 ? { draught: st.draught } : {}), ...(st.callSign ? { callSign: st.callSign } : {}) };
     }
     const calls = mergeCalls(old?.calls, detectCalls(fresh.length ? track.filter((p) => p[0] >= fresh[0][0] - 8 * HOUR) : [], ports));
-    out[id] = { mmsi: mm, by: mmsi.get(mm)?.by, track, ...(voyage ? { voyage } : {}), ...(calls.length ? { calls } : {}) };
+    const facts = st ? { ...(st.imo ? { imo: st.imo } : {}), ...(st.len > 20 ? { length: st.len, beam: st.beam } : {}) } : old?.ais;
+    // Underway with a destination: the lane route there, for estimating where it is until it is heard again.
+    let est = old?.est && old.est.from === last[0] ? old.est : null;
+    const dp = voyage?.port, moving = last[3] >= 3 && last[6] !== 1 && last[6] !== 5;
+    if (!est && moving && dp && dp.lat !== undefined && end - last[0] < 3 * 864e5 && voyage.at >= last[0] - 24 * HOUR && distNm(last[1], last[2], dp.lat, dp.lon) > 10) {
+      const r = route(last[1], last[2], dp.lat, dp.lon); if (r) est = { from: last[0], to: dp.name, ...r };
+    }
+    out[id] = { mmsi: mm, by: mmsi.get(mm)?.by, track, ...(voyage ? { voyage } : {}), ...(est ? { est } : {}), ...(calls.length ? { calls } : {}), ...(facts && Object.keys(facts).length ? { ais: facts } : {}) };
   }
-  const heardNow = [...pings.keys()].filter((id) => out[id]?.track.some((p) => now - p[0] < LISTEN_S * 1000 + MIN));
+  const heardNow = [...pings.keys()].filter((id) => out[id]?.track.some((p) => end - p[0] < LISTEN_S * 1000 + MIN));
   const ok = !!KEY && result.opened && !(result.error && stats.messages === 0);
   const data = {
-    schema: 2, generatedAt: new Date(now).toISOString(), status: !KEY ? 'no-key' : ok ? 'ok' : 'error', ...(ok ? {} : { error: result.error || 'AISStream sent no data' }),
-    window: { seconds: KEY ? LISTEN_S : 0 }, stats: { ...stats, shipsHeard: heardNow.length, shipsKnown: Object.keys(out).length },
+    schema: 2, generatedAt: new Date(end).toISOString(), status: !KEY ? 'no-key' : ok ? 'ok' : 'error', ...(ok ? {} : { error: result.error || 'AISStream sent no data' }),
+    window: { seconds: KEY ? LISTEN_S : 0 }, stats: { ...stats, shipsHeard: heardNow.length, shipsKnown: Object.keys(out).length, estimated: Object.values(out).filter((o) => o.est).length },
     mmsi: Object.fromEntries(mmsi), blocked: [...blocked], ships: out,
   };
   await save('ais.json', data);
@@ -346,7 +441,7 @@ async function ais() {
     for (const r of [...dbg.values()].slice(0, 120)) log(`  ${r.mmsi} ${JSON.stringify(r.name)} type=${r.type} imo=${r.imo} dest=${JSON.stringify(r.dest || '')}`);
   }
   const names = heardNow.map((id) => { const v = out[id].voyage; return `${byId.get(id).name}${v ? ` -> ${v.port?.name || JSON.stringify(v.dest)}` : ''}`; });
-  return { ok, at: now, error: data.error, note: `${stats.messages} messages, ${heardNow.length} heard now, ${Object.keys(out).length} of ${ships.length} known: ${names.join('; ') || 'none'}` };
+  return { ok, at: end, error: data.error, note: `${stats.messages} messages, ${heardNow.length} heard now, ${Object.keys(out).length} of ${ships.length} known: ${names.join('; ') || 'none'}` };
 }
 
 // ---------------------------------------------------------------- run

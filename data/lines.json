@@ -138,5 +138,61 @@
   "currency": "GBP",
   "cabin": "Inside",
   "book": "https://www.pocruises.com/find-a-cruise"
+ },
+ "tui": {
+  "name": "TUI Cruises",
+  "color": "#9fe870",
+  "currency": "EUR",
+  "cabin": "Inside",
+  "book": "https://www.meinschiff.com/"
+ },
+ "marella": {
+  "name": "Marella Cruises",
+  "color": "#4fd1c5",
+  "currency": "GBP",
+  "cabin": "Inside",
+  "book": "https://www.tui.co.uk/cruise"
+ },
+ "azamara": {
+  "name": "Azamara",
+  "color": "#a0b4ff",
+  "currency": "USD",
+  "cabin": "Interior",
+  "book": "https://www.azamara.com/"
+ },
+ "hurtigruten": {
+  "name": "Hurtigruten",
+  "color": "#ff9e9e",
+  "currency": "EUR",
+  "cabin": "Inside",
+  "book": "https://www.hurtigruten.com/"
+ },
+ "fred-olsen": {
+  "name": "Fred. Olsen",
+  "color": "#d4a373",
+  "currency": "GBP",
+  "cabin": "Inside",
+  "book": "https://www.fredolsencruises.com/"
+ },
+ "saga": {
+  "name": "Saga Cruises",
+  "color": "#c3e88d",
+  "currency": "GBP",
+  "cabin": "Balcony",
+  "book": "https://travel.saga.co.uk/cruises/"
+ },
+ "ambassador": {
+  "name": "Ambassador Cruise Line",
+  "color": "#89ddff",
+  "currency": "GBP",
+  "cabin": "Inside",
+  "book": "https://www.ambassadorcruiseline.com/"
+ },
+ "hapag-lloyd": {
+  "name": "Hapag-Lloyd Cruises",
+  "color": "#f78c6c",
+  "currency": "EUR",
+  "cabin": "Suite",
+  "book": "https://www.hl-cruises.com/"
  }
 }

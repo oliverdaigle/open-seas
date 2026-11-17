@@ -6,7 +6,7 @@ import { SRC } from '../data/ais.js';
 import { PORT, SEA } from '../fleet.js';
 
 const pop = () => $('#pop');
-const heard = (app, ship) => { const t = app.ais.lastSeen(ship.id); return !t ? 'not heard yet' : Date.now() - t < 45 * 6e4 ? 'live' : ago(t); };
+const heard = (app, ship) => { const t = app.ais.lastSeen(ship.id); return t ? ago(t) : 'not heard yet'; };
 let open = null;
 
 const head = (title, sub = '') => `<div class="pop-head"><div><h2>${esc(title)}</h2>${sub ? `<p class="note" style="margin:-4px 0 12px">${sub}</p>` : ''}</div><button type="button" class="x" data-close aria-label="Close">×</button></div>`;
@@ -59,11 +59,11 @@ const views = {
   fleet(app) {
     const id = app.fleetLine || app.sel.ship?.line || 'royal-caribbean', ships = app.fleet.ships.filter((s) => s.line === id).sort((a, b) => b.year - a.year), yr = new Date().getFullYear();
     const maxGt = Math.max(...ships.map((s) => s.gt)), byClass = new Map(); for (const s of ships) { if (!byClass.has(s.class)) byClass.set(s.class, []); byClass.get(s.class).push(s); }
-    pop().innerHTML = head('Fleets', 'The ships this site tracks, grouped into sister-ship classes, with when AIS last heard each one.')
+    pop().innerHTML = head('Fleets', 'The ships this site tracks, grouped into sister-ship classes.')
       + `<label class="field"><span>Cruise line</span><select id="fleet-line">${Object.entries(app.lines).map(([k, l]) => `<option value="${k}" ${k === id ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
       <dl class="spec" style="margin-bottom:12px"><div><dt>Ships</dt><dd>${ships.length}</dd></div><div><dt>Average age</dt><dd>${(ships.reduce((a, s) => a + yr - s.year, 0) / ships.length).toFixed(1)} yr</dd></div><div><dt>Guest berths</dt><dd>${num(ships.reduce((a, s) => a + s.pax, 0))}</dd></div></dl>`
       + [...byClass].map(([cls, list]) => `<h3 style="margin-top:12px">${esc(cls)} class · ${list.length}</h3><ul class="list" style="margin-top:0">${list.map((s) => `<li><button type="button" data-ship="${s.id}"><span class="t">${esc(s.name)}</span><span class="v">${esc(heard(app, s))}</span><span class="s agebar"><i style="width:${(s.gt / maxGt * 100).toFixed(0)}%"></i><em>${Math.round(s.gt / 1000)}k</em></span></button></li>`).join('')}</ul>`).join('')
-      + `<p class="note">Bars show gross tonnage relative to the largest ship in the fleet. AIS is picked up near coasts, so a ship far offshore can go unheard for days.</p>`;
+      + `<p class="note">Bars show gross tonnage relative to the largest ship in the fleet. Times are the ship’s last AIS report.</p>`;
     pop().onchange = (e) => { if (e.target.id === 'fleet-line') { app.fleetLine = e.target.value; views.fleet(app); } };
   },
 };
@@ -96,16 +96,13 @@ export function initChrome(app) {
 
   // ---- "right now at sea" ----
   app.refreshStats = () => {
-    let live = 0, shown = 0, sea = 0, port = 0; const counts = new Map(), o = {};
+    let sea = 0, port = 0; const counts = new Map(), o = {};
     for (const ship of app.fleet.ships) {
-      const s = app.shipState(ship, o); if (!s.status) continue;
-      shown++; if (s.src === SRC.LIVE || s.src === SRC.ESTIMATED) live++;
-      if (s.src === SRC.LAST) continue;
+      const s = app.shipState(ship, o); if (!s.status || s.src === SRC.LAST) continue;
       if (s.status === SEA) sea++; else { port++; if (s.port >= 0) { const c = app.fleet.portCodes[s.port]; counts.set(c, (counts.get(c) || 0) + 1); } }
     }
-    const busy = [...counts].sort((a, b) => b[1] - a[1])[0], missing = app.fleet.ships.length - shown;
-    $('#stats').innerHTML = `<span title="Heard on AIS in the last 45 minutes"><b>${live}</b> live</span><span><b>${sea}</b> underway</span><span><b>${port}</b> stopped</span>`
-      + `<span title="Ships AIS has not heard in the last 30 days are not drawn"><b>${missing}</b> not heard yet</span>${busy && busy[1] > 1 ? `<span>Busiest port <b>${esc(shortPort(app.fleet.ports[busy[0]].name))}</b> · ${busy[1]}</span>` : ''}`;
+    const busy = [...counts].sort((a, b) => b[1] - a[1])[0];
+    $('#stats').innerHTML = `<span><b>${sea}</b> underway</span><span><b>${port}</b> in port</span>${busy && busy[1] > 1 ? `<span>Busiest port <b>${esc(shortPort(app.fleet.ports[busy[0]].name))}</b> · ${busy[1]}</span>` : ''}`;
   };
 
   // ---- cinematic tour ----
@@ -120,7 +117,7 @@ export function initChrome(app) {
     const pick = heardShips.slice().sort((a, b) => (app.ais.voyages.has(b.id) - app.ais.voyages.has(a.id)) || b.gt - a.gt)[0];
     const storm = app.weather.stormsAt(app.time.t)[0];
     const steps = [
-      async () => { app.goNow(); say(`Every marker is a cruise ship where AIS last heard it. ${heardShips.length} of the ${app.fleet.ships.length} tracked ships have been heard in the last six hours.`); await app.globe.flyTo({ lat: 38, lon: -35, dist: 2.9 }, 2600); return wait(4200, id); },
+      async () => { app.goNow(); say('Every marker is a cruise ship: where AIS last heard it, or, out of range, estimated along the shipping lane to the port it is heading for.'); await app.globe.flyTo({ lat: 38, lon: -35, dist: 2.9 }, 2600); return wait(4200, id); },
       pick && (async () => { app.selectShip(pick.id, { fly: true, quiet: true }); const v = app.ais.voyages.get(pick.id); say(`${pick.name}. Amber is the track it has actually sailed${v ? `; dashed is the way to ${v.port && !v.port.unresolved ? shortPort(v.port.name) : `“${v.dest}”`}, the destination it is broadcasting` : ''}.`); return wait(7000, id); }),
       storm && (async () => { app.clearSelection(); app.fx.layers.storms = true; say(`${storm.name}. The cone is projected from its current motion. Ships heading into it are flagged.`); await app.globe.flyTo({ lat: storm.lat + 3, lon: storm.lon, dist: 0.55 }, 2600); return wait(5200, id); }),
       async () => { app.clearSelection(); app.pause(); app.setTime(Date.now() - 24 * 36e5); app.setRate(3600); app.play(); say('Replaying the last 24 hours of real AIS reports at one hour per second.'); await app.globe.flyTo({ lat: 45, lon: -10, dist: 1.6 }, 2600); return wait(9000, id); },
