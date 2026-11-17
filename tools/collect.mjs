@@ -25,7 +25,8 @@ const WX_EVERY = 3 * HOUR - 15 * MIN;
 const GX = 18, GY = 11;             // weather grid: every 20 degrees of longitude, 15 of latitude (matches js/data/weather.js)
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
-const errText = (e) => (e?.name === 'AbortError' ? 'timed out' : e?.message || String(e));
+const errText = (e) => (e?.name === 'AbortError' ? 'timed out' : `${e?.message || e}${e?.cause ? ` (${e.cause.code || e.cause.message || e.cause})` : ''}`);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function getJSON(url, ms = 30000) {
   const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), ms);
@@ -47,9 +48,13 @@ async function grid(url, vars, extra) {
   const lats = [], lons = [];
   for (let j = 0; j < GY; j++) for (let i = 0; i < GX; i++) { lats.push(-75 + 15 * j); lons.push(-180 + 20 * i); }
   const names = vars.split(','), out = { at: Date.now(), source: url, times: null, v: Object.fromEntries(names.map((n) => [n, []])) };
-  for (let c = 0; c < lats.length; c += 99) {
-    const q = `${url}?latitude=${lats.slice(c, c + 99).join(',')}&longitude=${lons.slice(c, c + 99).join(',')}&hourly=${vars}${extra}&past_days=7&forecast_days=7&timeformat=unixtime&timezone=GMT`;
-    let res; try { res = await getJSON(q + '&temporal_resolution=hourly_6', 60000); } catch { res = await getJSON(q, 90000); }
+  for (let c = 0; c < lats.length; c += 50) {
+    const q = `${url}?latitude=${lats.slice(c, c + 50).join(',')}&longitude=${lons.slice(c, c + 50).join(',')}&hourly=${vars}${extra}&past_days=7&forecast_days=7&timeformat=unixtime&timezone=GMT`;
+    let res, last;
+    for (const [suffix, wait] of [['&temporal_resolution=hourly_6', 0], ['', 3000], ['&temporal_resolution=hourly_6', 15000]]) {
+      try { if (wait) await sleep(wait); res = await getJSON(q + suffix, 60000); break; } catch (e) { last = e; log(`${url.split('/')[2]} rows ${c}-${c + 49}: ${errText(e)}, retrying`); }
+    }
+    if (!res) throw last;
     for (const loc of [].concat(res)) {
       const tt = loc.hourly.time, stride = tt.length > 1 && tt[1] - tt[0] < 6 * 3600 ? Math.round(6 * 3600 / (tt[1] - tt[0])) : 1;
       if (!out.times) out.times = tt.filter((_, k) => k % stride === 0).map((s) => s * 1000);
