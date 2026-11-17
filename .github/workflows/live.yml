@@ -13,6 +13,10 @@ on:
         description: Refresh the weather grids even if they are recent
         type: boolean
         default: false
+      debug_ais:
+        description: Log every passenger vessel AIS hears
+        type: boolean
+        default: false
 
 permissions:
   contents: write   # only for the keep-alive commit below
@@ -47,6 +51,7 @@ jobs:
           AISSTREAM_API_KEY: ${{ secrets.AISSTREAM_API_KEY }}
           SITE_URL: ${{ steps.pages.outputs.base_url }}
           FORCE_WEATHER: ${{ inputs.force_weather && '1' || '' }}
+          DEBUG_AIS: ${{ inputs.debug_ais && '1' || '' }}
 
       - uses: actions/upload-pages-artifact@v3
         with:

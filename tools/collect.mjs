@@ -16,7 +16,8 @@ const OUT = new URL('data/live/', ROOT);
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const KEY = (process.env.AISSTREAM_API_KEY || '').trim();
 const AIS_URL = process.env.AIS_URL || 'wss://stream.aisstream.io/v0/stream';
-const LISTEN_S = Number(process.env.AIS_SECONDS || 150);
+const LISTEN_S = Number(process.env.AIS_SECONDS || 240);
+const DEBUG_AIS = !!process.env.DEBUG_AIS;
 const FORCE_WEATHER = !!process.env.FORCE_WEATHER;
 const MIN = 6e4, HOUR = 36e5;
 const KEEP_MS = 24 * HOUR;          // ping history kept per ship
@@ -149,10 +150,21 @@ async function ais() {
   const anyFor = (id) => [...mmsi.entries()].find(([, m]) => m.id === id);
   const drop = (mm) => { mmsi.delete(mm); blocked.add(mm); };
 
-  const pings = new Map(), stats = { messages: 0, positions: 0, staticReports: 0, matchedPositions: 0 };
+  const pings = new Map(), stats = { messages: 0, positions: 0, staticReports: 0, matchedPositions: 0, emptyNames: 0 };
+  const dbg = new Map(), CRUISY = /OF THE SEAS|CARNIVAL|^MSC |NORWEGIAN|PRINCESS|CELEBRITY|VIKING|DISNEY|AIDA|COSTA|QUEEN|VIRGIN|SEABOURN|SILVER|SEVEN SEAS|REGATTA|EXPLORA|RITZ|ODYSSEY|NIEUW|ROTTERDAM|EURODAM|KONINGSDAM/;
   const onMessage = (m) => {
     stats.messages++;
     const meta = m.MetaData || {}, mm = String(meta.MMSI ?? '');
+    if (m.MessageType === 'PositionReport' && !String(meta.ShipName || '').trim()) stats.emptyNames++;
+    if (DEBUG_AIS) {
+      const name = String(meta.ShipName || '').trim(), sd = m.Message?.ShipStaticData;
+      if ((sd && PASSENGER(+sd.Type)) || CRUISY.test(name.toUpperCase())) {
+        const d = dbg.get(mm) || { mmsi: mm, name, n: 0 }; d.n++;
+        if (sd) Object.assign(d, { imo: sd.ImoNumber, type: sd.Type, dest: sd.Destination, eta: sd.Eta, callSign: sd.CallSign });
+        if (meta.latitude !== undefined) Object.assign(d, { lat: meta.latitude, lon: meta.longitude });
+        d.matched = byName.has(norm(name)) ? byName.get(norm(name)).id : null; dbg.set(mm, d);
+      }
+    }
     if (!mm || blocked.has(mm)) return;
     if (m.MessageType === 'ShipStaticData') {
       stats.staticReports++;
@@ -216,6 +228,12 @@ async function ais() {
     mmsi: Object.fromEntries(mmsi), blocked: [...blocked], from, tracks,
   };
   await save('ais.json', data);
+  if (DEBUG_AIS) {
+    const rows = [...dbg.values()].sort((a, b) => b.n - a.n);
+    await save('ais-debug.json', rows);
+    log(`AIS debug: ${rows.length} passenger or cruise-named vessels, ${stats.emptyNames} position reports without a name`);
+    for (const r of rows.slice(0, 80)) log(`  ${r.mmsi} ${JSON.stringify(r.name)} type=${r.type ?? '?'} imo=${r.imo ?? '?'} dest=${JSON.stringify(r.dest ?? '')} matched=${r.matched ?? '-'} n=${r.n}`);
+  }
   return { ok, at: now, error: data.error, note: `${stats.messages} messages, ${seenNow.length} of ${ships.length} ships seen: ${seenNow.map((id) => byId.get(id).name).join(', ') || 'none'}` };
 }
 
