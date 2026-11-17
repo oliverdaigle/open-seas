@@ -128,6 +128,8 @@ function drawMinimap(app, ship, s, dest) {
   if (s.status) { c.fillStyle = '#5fd4e6'; c.strokeStyle = '#02040a'; c.lineWidth = 3; c.beginPath(); c.arc(X(end[1]), Y(end[0]), 8, 0, 7); c.fill(); c.stroke(); }
 }
 
+const arrived = (s, v) => s.status === PORT && v?.port?.lat !== undefined && distNm(s.lat, s.lon, v.port.lat, v.port.lon) < 6;
+
 function voyageHtml(app, ship, s) {
   const v = app.ais.voyages.get(ship.id), t = app.time.t, real = Date.now();
   if (!v) return `<p class="note" style="margin:0">${s.status ? 'This ship hasn’t broadcast a destination since the site started listening. Ships repeat it every 6 minutes, so it usually appears within a few collections.' : 'Not heard on AIS yet.'}</p>`;
@@ -135,8 +137,9 @@ function voyageHtml(app, ship, s) {
   rows.push(`<p class="voy-name">${p && !p.unresolved ? esc(placeName(p)) : esc(v.dest || 'No destination set')}</p>`);
   rows.push(`<p class="voy-dates">Broadcast as “${esc(v.dest)}” · updated ${esc(ago(v.at))}${p?.unresolved ? ' · port not recognised' : ''}</p>`);
   const dl = [];
-  if (v.eta) dl.push(`<div><dt>ETA</dt><dd style="font-size:13px">${esc(fmtDate(v.eta))}${v.etaTimeKnown ? ` ${fmtTime(v.eta)} UTC` : ''}<br><small>${esc(relative(v.eta, real))}</small></dd></div>`);
-  if (p && p.lat !== undefined && s.status && Math.abs(t - real) < 6 * HOUR) {
+  if (arrived(s, v)) rows.push(`<p class="note" style="margin:0 0 10px">Alongside at its broadcast destination now. The crew usually sets the next port when the ship sails.</p>`);
+  if (v.eta) dl.push(`<div><dt>${arrived(s, v) ? 'Arrived (ETA)' : 'ETA'}</dt><dd style="font-size:13px">${esc(fmtDate(v.eta))}${v.etaTimeKnown ? ` ${fmtTime(v.eta)} UTC` : ''}<br><small>${esc(relative(v.eta, real))}</small></dd></div>`);
+  if (p && p.lat !== undefined && s.status && !arrived(s, v) && Math.abs(t - real) < 6 * HOUR) {
     const nm = distNm(s.lat, s.lon, p.lat, p.lon), hrs = s.sog > 3 ? nm / s.sog : null;
     dl.push(`<div><dt>Distance</dt><dd style="font-size:13px">${num(nm)} nm${hrs ? `<br><small>about ${hrs < 48 ? `${Math.round(hrs)} h` : `${(hrs / 24).toFixed(1)} days`} at ${s.sog.toFixed(0)} kn</small>` : ''}</dd></div>`);
   }
@@ -176,6 +179,7 @@ export function updateShipPanel(app, force) {
   f('sog').innerHTML = s.status ? `${s.sog.toFixed(1)} <small>kn</small>` : '–';
   f('hdg').innerHTML = s.status === SEA ? `${String(Math.round(s.cog ?? s.hdg) % 360).padStart(3, '0')}° <small>${compass(s.cog ?? s.hdg)}</small>` : s.status === PORT ? `<small>${s.port >= 0 ? `at ${esc(shortPort(app.fleet.ports[app.fleet.portCodes[s.port]].name))}` : 'stopped'}</small>` : '–';
   f('pos').textContent = s.status ? `${fmtLat(s.lat)} ${fmtLon(s.lon)}` : '–';
+  $('[data-f="next"]', p).previousElementSibling.textContent = arrived(s, v) ? 'At' : 'Heading to';
   f('next').innerHTML = v ? `${esc(v.port && !v.port.unresolved ? shortPort(v.port.name) : v.dest || '–')}${v.eta ? `<br><small>ETA ${esc(fmtDate(v.eta))}${v.etaTimeKnown ? ` ${fmtTime(v.eta)} UTC` : ''}</small>` : ''}` : '<small>not broadcast yet</small>';
   // the slower sections only when something they show has changed
   const key = `${Math.floor(t / (10 * 6e4))}:${app.ais.lastSeen(ship.id)}:${v?.at || 0}:${s.status}`;
