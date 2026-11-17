@@ -129,7 +129,7 @@ export class WeatherFX {
   }
   loadSat(t) {
     const url = this.weather.cloudImageUrl(t), day = Math.floor(t / 864e5);
-    if (!url) { this.cloudU.uSat.value = 0; this.satDay = null; if (this.weather.cloudImageUrl(Date.now() - 2 * 864e5)) setSource('clouds', 'demo', 'Satellite imagery exists for past dates only. Today and the future use modelled clouds.'); return; }
+    if (!url) { this.cloudU.uSat.value = 0; this.satDay = null; if (this.weather.cloudImageUrl(Date.now() - 2 * 864e5)) setSource('clouds', 'off', 'Satellite photos exist for past days only. Scrub back a day to see them. Today’s clouds come from the Open-Meteo forecast grid.'); return; }
     if (day === this.satDay || day === this.satWant) return;
     this.satWant = day;
     const img = new Image(); img.crossOrigin = 'anonymous';

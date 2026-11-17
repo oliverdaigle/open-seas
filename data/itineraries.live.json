@@ -1,5 +1,0 @@
-{
- "note": "Optional. Add real published sailings here to replace the demo itinerary for a ship. Same format as itineraries.json: templates keyed by id, sailings keyed by ship id as [departure date, template id]. A ship listed here stops showing the Demo itinerary badge.",
- "templates": {},
- "sailings": {}
-}

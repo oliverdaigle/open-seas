@@ -1,5 +1,5 @@
-// The timeline: scrub from 30 days back to 12 months ahead, play at four speeds, snap back to now.
-import { $, $$, fmtDateY, fmtTime, monthName, relative } from './util.js';
+// The timeline: replay the last week of AIS reports, play at four speeds, snap back to now.
+import { $, $$, fmtDateY, fmtTime, fmtDate, relative } from './util.js';
 
 const DAY = 864e5;
 export class Timeline {
@@ -32,25 +32,26 @@ export class Timeline {
     const { min, max } = this.app.time, cv = this.cv, dpr = Math.min(2, window.devicePixelRatio || 1), w = this.track.clientWidth, h = this.track.clientHeight;
     if (!w) return;
     cv.width = w * dpr; cv.height = h * dpr; const c = cv.getContext('2d'); c.scale(dpr, dpr);
-    const x = (t) => ((t - min) / (max - min)) * w, now = Date.now(), base = h - 14;
-    c.fillStyle = 'rgba(255,181,71,0.10)'; c.fillRect(0, 0, x(now), base);
-    c.fillStyle = 'rgba(95,212,230,0.07)'; c.fillRect(x(now), 0, w - x(now), base);
+    const x = (t) => ((t - min) / (max - min)) * w, base = h - 14;
+    // how many tracked ships AIS heard in each hour: where the replay has real data
+    const bins = Math.max(1, Math.floor(w / 4)), count = new Float32Array(bins), span = (max - min) / bins;
+    for (const tr of this.app.ais?.tracks.values() || []) {
+      let lastBin = -1;
+      for (const p of tr) { if (p.t < min || p.t > max) continue; const k = Math.min(bins - 1, Math.floor((p.t - min) / span)); if (k !== lastBin) { count[k]++; lastBin = k; } }
+    }
+    const top = Math.max(1, ...count);
+    c.fillStyle = 'rgba(255,181,71,0.55)';
+    for (let k = 0; k < bins; k++) if (count[k]) { const bh = Math.max(2, (count[k] / top) * (base - 6)); c.fillRect(k * (w / bins), base - bh, Math.max(1, w / bins - 1), bh); }
     const wx = this.app.weather.liveRange();
     if (wx) { c.fillStyle = 'rgba(95,212,230,0.9)'; c.fillRect(x(Math.max(min, wx[0])), base - 2, x(Math.min(max, wx[1])) - x(Math.max(min, wx[0])), 2); }
     c.font = '500 10px "Spline Sans Mono", ui-monospace, monospace'; c.textBaseline = 'alphabetic';
-    const d = new Date(min); d.setUTCDate(1); d.setUTCHours(0, 0, 0, 0);
-    for (; +d < max; d.setUTCMonth(d.getUTCMonth() + 1)) {
-      const px = x(+d); if (px < 0) continue;
-      c.fillStyle = 'rgba(150,190,230,0.35)'; c.fillRect(Math.round(px), 0, 1, base);
-      c.fillStyle = d.getUTCMonth() === 0 ? '#e7eef7' : '#8ea2b8';
-      if (w / ((max - min) / (30.4 * DAY)) > 34 || d.getUTCMonth() % 2 === 0) c.fillText(d.getUTCMonth() === 0 ? String(d.getUTCFullYear()) : monthName(d.getUTCMonth()).toUpperCase(), px + 4, h - 2);
+    for (let t = Math.ceil(min / DAY) * DAY; t < max; t += DAY) {
+      const px = x(t); c.fillStyle = 'rgba(150,190,230,0.35)'; c.fillRect(Math.round(px), 0, 1, base);
+      c.fillStyle = '#8ea2b8'; if (px < w - 70) c.fillText(fmtDate(t).toUpperCase(), px + 4, h - 2);
     }
-    // week ticks
-    c.fillStyle = 'rgba(150,190,230,0.14)';
-    for (let t = Math.ceil(min / (7 * DAY)) * 7 * DAY; t < max; t += 7 * DAY) c.fillRect(Math.round(x(t)), base - 6, 1, 6);
-    c.fillStyle = '#ffb547'; c.fillRect(Math.round(x(now)) - 1, 0, 2, base);
-    c.fillText('NOW', Math.min(w - 26, x(now) + 5), 10);
-    this.lastDraw = now;
+    c.fillStyle = '#ffb547'; c.fillRect(Math.round(x(max)) - 2, 0, 2, base);
+    c.fillText('NOW', Math.max(0, x(max) - 30), 10);
+    this.lastDraw = Date.now();
   }
   update() {
     const { t, min, max, live, playing, rate } = this.app.time, now = performance.now();

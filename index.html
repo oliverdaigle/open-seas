@@ -21,7 +21,7 @@
   --cyan: #5fd4e6;       /* water, data, the future */
   --live: #3ddc97;
   --warn: #ff6a5e;
-  --demo: #b9a7ff;       /* anything simulated */
+  --demo: #b9a7ff;       /* modelled weather, used only when a feed fails */
   --display: "Big Shoulders Display", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
   --body: "Instrument Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: "Spline Sans Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -73,6 +73,7 @@ a.btn { display: inline-block; text-decoration: none; color: inherit; }
 .badge.demo { border: 1px dashed var(--demo); color: var(--demo); }
 .badge.live { border-color: var(--live); color: var(--live); }
 .badge.error, .badge.warn { border-color: var(--warn); color: var(--warn); }
+#mode-badge { cursor: pointer; }
 .badge.now { border-color: var(--amber); color: var(--amber); }
 .badge.future { border-color: var(--cyan); color: var(--cyan); }
 
@@ -224,12 +225,11 @@ dl { margin: 0; }
   <header id="top">
     <div class="brand">
       <h1>Open Seas</h1>
-      <span class="badge demo" id="mode-badge" title="Ship positions, itineraries and prices are simulated until you connect live sources">Demo data</span>
+      <span class="badge" id="mode-badge" title="Connecting to the AIS feed">Connecting</span>
     </div>
     <div id="stats" aria-live="off"></div>
     <nav id="tools" aria-label="Tools">
       <button type="button" data-pop="search" id="btn-search">Search</button>
-      <button type="button" data-pop="finder" id="btn-finder">Find a cruise</button>
       <button type="button" data-pop="layers" id="btn-layers">Layers</button>
       <button type="button" data-pop="fleet" id="btn-fleet">Fleets</button>
       <button type="button" data-pop="sources" id="btn-sources">Data sources</button>

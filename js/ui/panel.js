@@ -1,12 +1,21 @@
-// The detail panel: one ship (specs, voyage, weather, fares, booking) or one port (who is alongside).
-import { $, $$, esc, fmtDate, fmtDateY, fmtTime, fmtShort, num, shortPort, ago } from './util.js';
-import { fmtLat, fmtLon, compass, densify } from '../geo.js';
-import { money } from '../data/pricing.js';
-import { SRC, SRC_LABEL } from '../data/ais.js';
-import { PORT, SEA } from '../sim.js';
+// The detail panel: one ship (position, where it is going, where it has been, weather, specs) or one port
+// (who is alongside and who is heading there). Every fact here comes from AIS or the weather feeds.
+import { $, esc, fmtDate, fmtDateY, fmtTime, num, shortPort, ago, relative } from './util.js';
+import { fmtLat, fmtLon, compass, densify, distNm } from '../geo.js';
+import { SRC, SRC_LABEL, NAV } from '../data/ais.js';
+import { PORT, SEA } from '../fleet.js';
 
 const el = () => $('#panel');
+const DAY = 864e5, HOUR = 36e5;
 const host = (url) => { try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return 'the cruise line'; } };
+let regionNames = null;
+const country = (c) => {
+  if (!c || c.length !== 2) return c || '';
+  try { regionNames = regionNames || new Intl.DisplayNames(['en'], { type: 'region' }); return regionNames.of(c) || c; } catch { return c; }
+};
+const placeName = (p) => `${shortPort(p.name)}${p.country && country(p.country) !== shortPort(p.name) ? `, ${country(p.country)}` : ''}`;
+const lineSite = (line) => { try { const u = new URL(line.book.replaceAll('{code}', '').replaceAll('{date}', '')); return `${u.origin}/`; } catch { return null; } };
+const stamp = (ms) => `${fmtDate(ms)} ${fmtTime(ms)} UTC`;
 
 // Side-profile drawing generated from the ship's size, in its line's colour.
 function silhouette(ship, color) {
@@ -28,46 +37,9 @@ function silhouette(ship, color) {
   </svg>`;
 }
 
-function fareCard(app, ship, v, isThis) {
-  const p = app.pricing.priceFor(v, ship.line), url = app.pricing.bookingUrl(ship, v), ports = app.fleet.ports;
-  const a = ship.stops[v.i0].port, b = ship.stops[v.i1].port, route = a === b ? `${shortPort(ports[a].name)} round trip` : `${shortPort(ports[a].name)} to ${shortPort(ports[b].name)}`;
-  let price;
-  if (p.state === 'live' || p.state === 'demo') price = `<b>${esc(money(p.pricePerPerson, p.currency))}</b><small>per person · ${esc(p.cabin)}</small>`;
-  else price = `<b style="font-size:12px;color:var(--muted)">Price unavailable</b>`;
-  const foot = p.state === 'demo' ? `<span class="badge demo">Demo price</span><small>Sample figure, not a real fare</small>`
-    : p.state === 'live' ? `<span class="badge live">Scraped</span><small>${esc(p.occupancy)} occupancy${p.taxesIncluded ? '' : ', excl. taxes'} · as of ${esc(fmtDateY(Date.parse(p.asOf)))} ${esc(fmtTime(Date.parse(p.asOf)))} UTC</small>`
-    : `<small>${esc(p.reason || 'No price on file for this sailing')}</small>`;
-  const meta = p.state === 'demo' ? `${p.occupancy} occupancy, excl. taxes · as of ${fmtShort(Date.parse(p.asOf))}` : '';
-  return `<div class="sail${isThis ? ' this' : ''}">
-    <div class="n">${esc(v.name)}</div>
-    <div class="price">${price}</div>
-    <div class="m">${esc(fmtDateY(v.dep, ports[a].tz))} · ${v.nights} nights · ${esc(route)}${meta ? `<br>${esc(meta)}` : ''}</div>
-    <div class="foot"><span>${foot}</span></div>
-    <div class="foot"><button type="button" class="btn" data-goto="${v.dep}">View on globe</button>
-      <a class="btn primary" href="${esc(url)}" target="_blank" rel="noopener">Book on ${esc(host(url))}</a></div>
-  </div>`;
-}
-
 export function renderShipPanel(app, ship) {
-  const line = app.lines[ship.line], t = app.time.t, s = app.shipState(ship), ports = app.fleet.ports;
-  const v = s.voy >= 0 ? ship.voyages[s.voy] : null, real = Date.now();
+  const line = app.lines[ship.line], site = lineSite(line), info = app.ais.info.get(ship.id) || {};
   const sisters = app.fleet.ships.filter((o) => o.line === ship.line && o.class === ship.class && o.id !== ship.id);
-  const upcoming = ship.voyages.filter((o) => o.dep > Math.max(t, real) && o !== v).slice(0, 4);
-  const thisBookable = v && v.dep > real;
-  let voyage = `<p class="note">No sailing on file for this ship at the selected time.</p>`;
-  if (v) {
-    const rows = [];
-    for (let i = v.i0; i <= v.i1; i++) {
-      const st = ship.stops[i], p = ports[st.port], first = i === v.i0, last = i === v.i1;
-      const when = first ? st.dep : st.arr, hrs = first ? `dep ${fmtTime(st.dep, p.tz)}` : last ? `arr ${fmtTime(st.arr, p.tz)}` : `${fmtTime(st.arr, p.tz)}–${fmtTime(st.dep, p.tz)}`;
-      rows.push(`<li data-stop="${i}"><span class="d">${esc(fmtDate(when, p.tz))}</span><span>${esc(p.name)}</span><span class="h">${hrs}</span></li>`);
-    }
-    voyage = `<p class="voy-name">${esc(v.name)}</p>
-      <p class="voy-dates">${esc(fmtDateY(v.dep, ports[ship.stops[v.i0].port].tz))} to ${esc(fmtDateY(v.arr, ports[ship.stops[v.i1].port].tz))} · ${v.nights} nights · port times are local</p>
-      <div class="bar" aria-hidden="true"><i data-f="progress"></i></div>
-      <canvas class="minimap" width="724" height="362" aria-label="Map of this itinerary"></canvas>
-      <ul class="calls">${rows.join('')}</ul>`;
-  }
   el().innerHTML = `
     <div class="p-head">
       <button type="button" class="x" data-close aria-label="Close">×</button>
@@ -86,43 +58,50 @@ export function renderShipPanel(app, ship) {
       <div data-f="alert"></div>
       <dl class="readout">
         <div><dt>Speed</dt><dd data-f="sog">–</dd></div>
-        <div><dt>Heading</dt><dd data-f="hdg">–</dd></div>
+        <div><dt>Course</dt><dd data-f="hdg">–</dd></div>
         <div><dt>Position</dt><dd data-f="pos" style="font-size:13px">–</dd></div>
-        <div><dt data-f="nextlbl">Next port</dt><dd data-f="next" style="font-size:13px">–</dd></div>
+        <div><dt>Heading to</dt><dd data-f="next" style="font-size:13px">–</dd></div>
       </dl>
     </div>
-    <div class="p-sec"><h3>Voyage at the selected time ${app.data.realShips.has(ship.id) ? '' : '<span class="badge demo" title="A typical itinerary for this ship, not the line’s published schedule">Demo itinerary</span>'}</h3>${voyage}</div>
+    <div class="p-sec"><h3>Where it’s going</h3><div data-f="voyage"></div></div>
+    <div class="p-sec"><h3>Where it’s been</h3>
+      <canvas class="minimap" width="724" height="362" aria-label="Map of the track this ship has sailed"></canvas>
+      <div data-f="history"></div>
+    </div>
     <div class="p-sec"><h3>Weather at the ship</h3>
       <dl class="readout" data-f="wx"><div><dt>Wind</dt><dd>…</dd></div><div><dt>Waves</dt><dd>…</dd></div><div><dt>Sea</dt><dd>…</dd></div><div><dt>Air</dt><dd>…</dd></div></dl>
       <p class="note" data-f="wxsrc"></p>
     </div>
-    <div class="p-sec"><h3>Fares and booking</h3>
-      ${thisBookable ? fareCard(app, ship, v, true) : ''}
-      ${upcoming.map((o) => fareCard(app, ship, o, false)).join('') || (thisBookable ? '' : '<p class="note">No future sailings on file.</p>')}
-      <p class="note">Booking links open the cruise line’s own site. Always confirm the fare there.</p>
+    <div class="p-sec"><h3>Itinerary and booking</h3>
+      <p class="note" style="margin-top:0">Ships broadcast only their next destination, not the whole cruise. The full published itinerary is on the cruise line’s site.</p>
+      ${site ? `<div class="p-actions" style="margin-top:10px"><a class="btn primary" href="${esc(site)}" target="_blank" rel="noopener">Open ${esc(host(site))}</a></div>` : ''}
     </div>
     <div class="p-sec"><h3>Ship</h3>
       <dl class="spec">
         <div><dt>Built</dt><dd>${ship.year}</dd></div><div><dt>Tonnage</dt><dd>${num(ship.gt)} GT</dd></div><div><dt>Guests</dt><dd>${num(ship.pax)}</dd></div>
         <div><dt>Length</dt><dd>${ship.length} m</dd></div><div><dt>Flag</dt><dd>${esc(ship.flag)}</dd></div><div><dt>IMO</dt><dd>${ship.imo || 'not on file'}</dd></div>
-        <div><dt>Class</dt><dd>${esc(ship.class)}</dd></div>
+        <div><dt>Class</dt><dd>${esc(ship.class)}</dd></div><div><dt>MMSI</dt><dd>${info.mmsi || '–'}</dd></div><div><dt>Matched by</dt><dd>${info.by === 'imo' ? 'IMO number' : info.by === 'type' ? 'name + type' : info.by === 'name' ? 'name' : '–'}</dd></div>
       </dl>
       ${sisters.length ? `<h3 style="margin-top:14px">Sister ships</h3><div class="chips">${sisters.map((o) => `<button type="button" data-ship="${o.id}">${esc(o.name)}</button>`).join('')}</div>` : ''}
     </div>`;
   el().hidden = false; el().scrollTop = 0;
-  el()._ship = ship; el()._voy = v; el()._wxT = -1e18; el()._port = null;
+  el()._ship = ship; el()._wxT = -1e18; el()._port = null; el()._key = '';
   updateShipPanel(app, true);
 }
 
-function drawMinimap(app, ship, v, s) {
+// A small map of the track sailed (amber), where the ship is (cyan) and where it is going (dashed).
+function drawMinimap(app, ship, s, dest) {
   const cv = $('.minimap', el()); if (!cv) return;
-  const c = cv.getContext('2d'), W = cv.width, H = cv.height, ports = app.fleet.ports;
-  // unwrap longitudes so a Pacific crossing draws as one continuous line
+  const c = cv.getContext('2d'), W = cv.width, H = cv.height, raw = app.ais.trackUntil(ship.id, app.time.t);
+  if (s.status) raw.push([s.lat, s.lon]);
+  if (!raw.length) { cv.hidden = true; return; } cv.hidden = false;
   const pts = []; let prev = null;
-  for (let i = v.i0; i < v.i1; i++) { const g = ship.stops[i].geom; if (!g) continue; for (const p of densify(g.pts, 2)) { let lon = p[1]; if (prev !== null) while (lon - prev > 180) lon -= 360; if (prev !== null) while (lon - prev < -180) lon += 360; prev = lon; pts.push([p[0], lon]); } }
-  if (!pts.length) return;
-  let la0 = 90, la1 = -90, lo0 = 1e9, lo1 = -1e9; for (const [la, lo] of pts) { la0 = Math.min(la0, la); la1 = Math.max(la1, la); lo0 = Math.min(lo0, lo); lo1 = Math.max(lo1, lo); }
-  let spanLa = Math.max(5, (la1 - la0) * 1.35), spanLo = Math.max(10, (lo1 - lo0) * 1.3); if (spanLo < spanLa * 2) spanLo = spanLa * 2; else spanLa = spanLo / 2;
+  const unwrap = (lon) => { if (prev !== null) { while (lon - prev > 180) lon -= 360; while (lon - prev < -180) lon += 360; } prev = lon; return lon; };
+  for (const p of raw.length > 1 ? densify(raw, 2) : raw) pts.push([p[0], unwrap(p[1])]);
+  const end = pts[pts.length - 1], d = dest && dest.lat !== undefined ? [dest.lat, unwrap(dest.lon)] : null;
+  const all = d ? [...pts, d] : pts;
+  let la0 = 90, la1 = -90, lo0 = 1e9, lo1 = -1e9; for (const [la, lo] of all) { la0 = Math.min(la0, la); la1 = Math.max(la1, la); lo0 = Math.min(lo0, lo); lo1 = Math.max(lo1, lo); }
+  let spanLa = Math.max(3, (la1 - la0) * 1.4), spanLo = Math.max(6, (lo1 - lo0) * 1.3); if (spanLo < spanLa * 2) spanLo = spanLa * 2; else spanLa = spanLo / 2;
   const cLa = (la0 + la1) / 2, cLo = (lo0 + lo1) / 2, L0 = cLo - spanLo / 2, T0 = Math.min(90, cLa + spanLa / 2);
   const X = (lo) => ((lo - L0) / spanLo) * W, Y = (la) => ((T0 - la) / spanLa) * H;
   c.globalCompositeOperation = 'source-over'; c.fillStyle = '#000'; c.fillRect(0, 0, W, H);
@@ -134,45 +113,77 @@ function drawMinimap(app, ship, v, s) {
   }
   c.globalCompositeOperation = 'multiply'; c.fillStyle = 'rgb(24,58,92)'; c.fillRect(0, 0, W, H);
   c.globalCompositeOperation = 'lighten'; c.fillStyle = 'rgb(16,22,30)'; c.fillRect(0, 0, W, H);
-  c.globalCompositeOperation = 'source-over';
-  c.strokeStyle = '#ffb547'; c.lineWidth = 3; c.lineJoin = 'round'; c.beginPath(); pts.forEach(([la, lo], i) => (i ? c.lineTo(X(lo), Y(la)) : c.moveTo(X(lo), Y(la)))); c.stroke();
+  c.globalCompositeOperation = 'source-over'; c.lineJoin = 'round';
+  if (d && s.status) { c.strokeStyle = '#5fd4e6'; c.lineWidth = 2.5; c.setLineDash([10, 8]); c.beginPath(); c.moveTo(X(end[1]), Y(end[0])); c.lineTo(X(d[1]), Y(d[0])); c.stroke(); c.setLineDash([]); }
+  if (pts.length > 1) { c.strokeStyle = '#ffb547'; c.lineWidth = 3; c.beginPath(); pts.forEach(([la, lo], i) => (i ? c.lineTo(X(lo), Y(la)) : c.moveTo(X(lo), Y(la)))); c.stroke(); }
   c.font = '500 19px "Spline Sans Mono", ui-monospace, monospace'; c.textBaseline = 'middle';
-  const seen = new Set(); let ref = pts[0][1];
-  for (let i = v.i0; i <= v.i1; i++) {
-    const code = ship.stops[i].port; if (seen.has(code)) continue; seen.add(code);
-    const p = ports[code]; let lo = p.lon; while (lo - ref > 180) lo -= 360; while (lo - ref < -180) lo += 360;
-    const x = X(lo), y = Y(p.lat); c.fillStyle = '#fff'; c.beginPath(); c.arc(x, y, 5, 0, 7); c.fill();
-    const name = shortPort(p.name), tw = c.measureText(name).width, right = x + 10 + tw < W - 4;
-    c.fillStyle = 'rgba(2,8,16,0.75)'; c.fillRect(right ? x + 7 : x - 11 - tw, y - 12, tw + 6, 24); c.fillStyle = '#e7eef7'; c.fillText(name, right ? x + 10 : x - 8 - tw, y + 1);
+  const label = (la, lo, text) => {
+    const x = X(lo), y = Y(la); c.fillStyle = '#fff'; c.beginPath(); c.arc(x, y, 5, 0, 7); c.fill();
+    const tw = c.measureText(text).width, right = x + 10 + tw < W - 4;
+    c.fillStyle = 'rgba(2,8,16,0.75)'; c.fillRect(right ? x + 7 : x - 11 - tw, y - 12, tw + 6, 24); c.fillStyle = '#e7eef7'; c.fillText(text, right ? x + 10 : x - 8 - tw, y + 1);
+  };
+  const seen = new Set();
+  for (const call of app.ais.calls.get(ship.id) || []) { if (call.from > app.time.t || seen.has(call.name)) continue; seen.add(call.name); prev = end[1]; label(call.lat, unwrap(call.lon), shortPort(call.name)); }
+  if (d) label(d[0], d[1], shortPort(dest.name));
+  if (s.status) { c.fillStyle = '#5fd4e6'; c.strokeStyle = '#02040a'; c.lineWidth = 3; c.beginPath(); c.arc(X(end[1]), Y(end[0]), 8, 0, 7); c.fill(); c.stroke(); }
+}
+
+function voyageHtml(app, ship, s) {
+  const v = app.ais.voyages.get(ship.id), t = app.time.t, real = Date.now();
+  if (!v) return `<p class="note" style="margin:0">${s.status ? 'This ship hasn’t broadcast a destination since the site started listening. Ships repeat it every 6 minutes, so it usually appears within a few collections.' : 'Not heard on AIS yet.'}</p>`;
+  const p = v.port, rows = [];
+  rows.push(`<p class="voy-name">${p && !p.unresolved ? esc(placeName(p)) : esc(v.dest || 'No destination set')}</p>`);
+  rows.push(`<p class="voy-dates">Broadcast as “${esc(v.dest)}” · updated ${esc(ago(v.at))}${p?.unresolved ? ' · port not recognised' : ''}</p>`);
+  const dl = [];
+  if (v.eta) dl.push(`<div><dt>ETA</dt><dd style="font-size:13px">${esc(fmtDate(v.eta))}${v.etaTimeKnown ? ` ${fmtTime(v.eta)} UTC` : ''}<br><small>${esc(relative(v.eta, real))}</small></dd></div>`);
+  if (p && p.lat !== undefined && s.status && Math.abs(t - real) < 6 * HOUR) {
+    const nm = distNm(s.lat, s.lon, p.lat, p.lon), hrs = s.sog > 3 ? nm / s.sog : null;
+    dl.push(`<div><dt>Distance</dt><dd style="font-size:13px">${num(nm)} nm${hrs ? `<br><small>about ${hrs < 48 ? `${Math.round(hrs)} h` : `${(hrs / 24).toFixed(1)} days`} at ${s.sog.toFixed(0)} kn</small>` : ''}</dd></div>`);
   }
-  if (s.status) { let lo = s.lon; while (lo - ref > 180) lo -= 360; while (lo - ref < -180) lo += 360; c.fillStyle = '#5fd4e6'; c.strokeStyle = '#02040a'; c.lineWidth = 3; c.beginPath(); c.arc(X(lo), Y(s.lat), 8, 0, 7); c.fill(); c.stroke(); }
+  if (v.draught) dl.push(`<div><dt>Draught</dt><dd style="font-size:13px">${v.draught.toFixed(1)} m</dd></div>`);
+  if (dl.length) rows.push(`<dl class="readout">${dl.join('')}</dl>`);
+  rows.push(`<p class="note">The crew enters the destination and ETA into the ship’s AIS transponder. It is the ship’s own word, usually the next port of call.</p>`);
+  return rows.join('');
+}
+
+function historyHtml(app, ship) {
+  const t = app.time.t, calls = (app.ais.calls.get(ship.id) || []).filter((c) => c.from <= t).slice().reverse();
+  const nm = app.ais.sailedNm(ship.id, t, t - 7 * DAY), first = (app.ais.tracks.get(ship.id) || [])[0];
+  const parts = [];
+  if (first) parts.push(`<p class="note" style="margin-top:0">${nm > 1 ? `${num(nm)} nm sailed in the last 7 days of tracking. ` : ''}Tracked since ${esc(fmtDateY(first.t))}.</p>`);
+  if (calls.length) {
+    parts.push(`<ul class="calls">${calls.map((c) => {
+      const here = t - c.to < 3 * HOUR, sameDay = fmtDate(c.from) === fmtDate(c.to);
+      const span = c.to - c.from < 20 * 6e4 ? fmtTime(c.from) : sameDay ? `${fmtTime(c.from)}–${fmtTime(c.to)}` : `${fmtTime(c.from)} to ${fmtDate(c.to)} ${fmtTime(c.to)}`;
+      return `<li class="${here ? 'cur' : 'done'}"><span class="d">${esc(fmtDate(c.from))}</span><span>${esc(placeName(c))}${here ? ' · here now' : ''}</span><span class="h">${span} UTC</span></li>`;
+    }).join('')}</ul><p class="note">Port calls are worked out from AIS: times when the ship was moored or stopped next to a port.</p>`);
+  } else if (first) parts.push('<p class="note">No port calls recorded yet. They appear once AIS hears the ship moored or stopped next to a port.</p>');
+  else parts.push('<p class="note" style="margin-top:0">Not heard on AIS yet, so there’s no track to show.</p>');
+  return parts.join('');
 }
 
 export function updateShipPanel(app, force) {
   const p = el(), ship = p._ship; if (!ship || p.hidden) return;
-  const t = app.time.t, s = app.shipState(ship), ports = app.fleet.ports, real = Date.now(), f = (k) => $(`[data-f="${k}"]`, p);
-  const v = s.voy >= 0 ? ship.voyages[s.voy] : null;
-  if (!force && v !== p._voy) return renderShipPanel(app, ship);        // crossed into another sailing
+  const t = app.time.t, s = app.shipState(ship), real = Date.now(), f = (k) => $(`[data-f="${k}"]`, p), v = app.ais.voyages.get(ship.id);
   const b = [];
-  if (s.src === SRC.DEMO) {
-    b.push(`<span class="badge demo" title="Position computed from the demo itinerary, not from AIS">Demo position</span>`);
-    b.push(`<span class="badge">${Math.abs(t - real) < 3 * 6e4 ? 'Estimated from schedule' : t < real ? 'Reconstructed' : 'Scheduled'}</span>`);
-  } else b.push(`<span class="badge ${s.src === SRC.LIVE ? 'live' : s.src === SRC.STALE ? 'warn' : ''}">${SRC_LABEL[s.src]} AIS</span><span class="badge">Last seen ${esc(ago(s.seen))}</span>`);
-  b.push(`<span class="badge">${s.status === PORT ? 'In port' : s.status === SEA ? 'Underway' : 'No schedule'}</span>`);
+  if (!s.status) b.push('<span class="badge warn">Not heard on AIS yet</span>');
+  else {
+    b.push(`<span class="badge ${s.src === SRC.LIVE ? 'live' : s.src === SRC.LAST ? 'warn' : ''}">${SRC_LABEL[s.src]} AIS position</span><span class="badge">Heard ${esc(ago(s.seen))}</span>`);
+    b.push(`<span class="badge">${esc(NAV[s.nav] || (s.status === PORT ? 'Stopped' : 'Under way'))}</span>`);
+  }
   f('badges').innerHTML = b.join('');
-  f('alert').innerHTML = app.alerts.has(ship.index) ? `<div class="alertbox">Route crosses the forecast cone of ${esc(app.alertStorm || 'a storm')} within five days.</div>` : '';
+  f('alert').innerHTML = app.alerts.has(ship.index) ? `<div class="alertbox">On its way to its broadcast destination, this ship would cross the forecast cone of ${esc(app.alertStorm || 'a storm')} within five days.</div>` : '';
   f('sog').innerHTML = s.status ? `${s.sog.toFixed(1)} <small>kn</small>` : '–';
-  f('hdg').innerHTML = s.status === SEA ? `${String(Math.round(s.hdg) % 360).padStart(3, '0')}° <small>${compass(s.hdg)}</small>` : s.status === PORT ? '<small>alongside</small>' : '–';
+  f('hdg').innerHTML = s.status === SEA ? `${String(Math.round(s.cog ?? s.hdg) % 360).padStart(3, '0')}° <small>${compass(s.cog ?? s.hdg)}</small>` : s.status === PORT ? `<small>${s.port >= 0 ? `at ${esc(shortPort(app.fleet.ports[app.fleet.portCodes[s.port]].name))}` : 'stopped'}</small>` : '–';
   f('pos').textContent = s.status ? `${fmtLat(s.lat)} ${fmtLon(s.lon)}` : '–';
-  if (s.status && s.stop >= 0 && s.src === SRC.DEMO) {
-    const cur = ship.stops[s.stop], nx = ship.stops[s.stop + 1];
-    if (s.status === PORT) { f('nextlbl').textContent = cur.dep ? 'Sails' : 'In port'; f('next').innerHTML = `${esc(shortPort(ports[cur.port].name))}${cur.dep ? `<br><small>${esc(fmtDate(cur.dep, ports[cur.port].tz))} ${fmtTime(cur.dep, ports[cur.port].tz)} local</small>` : ''}`; }
-    else if (nx) { f('nextlbl').textContent = 'Next port'; f('next').innerHTML = `${esc(shortPort(ports[nx.port].name))}<br><small>ETA ${esc(fmtDate(nx.arr, ports[nx.port].tz))} ${fmtTime(nx.arr, ports[nx.port].tz)} local</small>`; }
-  } else if (v && s.status) f('next').innerHTML = '<small>see itinerary</small>';
-  if (v) {
-    f('progress').style.width = `${Math.max(0, Math.min(100, ((t - v.dep) / (v.arr - v.dep)) * 100)).toFixed(1)}%`;
-    $$('.calls li', p).forEach((li) => { const i = +li.dataset.stop, st = ship.stops[i]; li.className = st.dep !== null && t > st.dep ? 'done' : (s.status === PORT && i === s.stop) ? 'cur' : (s.status === SEA && i === s.stop + 1) ? 'next' : (i === v.i1 && t > st.arr) ? 'done' : ''; });
-    if (force || !p._mapT || Math.abs(t - p._mapT) > 20 * 6e4) { p._mapT = t; drawMinimap(app, ship, v, s); }
+  f('next').innerHTML = v ? `${esc(v.port && !v.port.unresolved ? shortPort(v.port.name) : v.dest || '–')}${v.eta ? `<br><small>ETA ${esc(fmtDate(v.eta))}${v.etaTimeKnown ? ` ${fmtTime(v.eta)} UTC` : ''}</small>` : ''}` : '<small>not broadcast yet</small>';
+  // the slower sections only when something they show has changed
+  const key = `${Math.floor(t / (10 * 6e4))}:${app.ais.lastSeen(ship.id)}:${v?.at || 0}:${s.status}`;
+  if (force || key !== p._key) {
+    p._key = key;
+    f('voyage').innerHTML = voyageHtml(app, ship, s);
+    f('history').innerHTML = historyHtml(app, ship);
+    drawMinimap(app, ship, s, v?.port && Math.abs(t - real) < 6 * HOUR ? v.port : null);
   }
   if (s.status && Math.abs(t - p._wxT) > 45 * 6e4) {
     p._wxT = t; const token = (p._wxTok = Math.random());
@@ -182,28 +193,34 @@ export function updateShipPanel(app, force) {
         <div><dt>Waves</dt><dd>${w.waveM.toFixed(1)} <small>m</small></dd></div>
         <div><dt>Sea</dt><dd>${w.sstC.toFixed(1)} <small>°C</small></dd></div>
         <div><dt>Air</dt><dd>${w.tempC.toFixed(0)} <small>°C · cloud ${Math.round(w.cloud)}%</small></dd></div>`;
-      f('wxsrc').innerHTML = `${w.live ? '<span class="badge live">Live</span>' : '<span class="badge demo">Demo</span>'} ${esc(w.source)}${w.live ? '' : '. Not a forecast.'}`;
+      f('wxsrc').innerHTML = `${w.live ? '<span class="badge live">Live</span>' : '<span class="badge demo">Modelled</span>'} ${esc(w.source)}${w.live ? '' : '. The live feed did not answer.'}`;
     });
-  }
+  } else if (!s.status) { f('wx').innerHTML = ''; f('wxsrc').textContent = 'Shown once the ship has a position.'; }
 }
 
 export function renderPortPanel(app, code) {
-  const p = app.fleet.ports[code], t = app.time.t, here = [], soon = [];
+  const p = app.fleet.ports[code], t = app.time.t, here = [], soon = [], recent = [], o = {}, real = Date.now();
+  const near = (q) => q && q.lat !== undefined && distNm(q.lat, q.lon, p.lat, p.lon) < 6;
   for (const ship of app.fleet.ships) {
-    const s = app.shipState(ship);
-    if (s.status === PORT && s.src === SRC.DEMO && ship.stops[s.stop]?.port === code) here.push(ship);
-    for (const st of ship.stops) if (st.port === code && st.arr > t && st.arr < t + 7 * 864e5) { soon.push([st.arr, ship]); break; }
+    const s = app.shipState(ship, o);
+    if (s.status === PORT && s.port >= 0 && app.fleet.portCodes[s.port] === code) here.push([ship, s.src]);
+    const v = app.ais.voyages.get(ship.id);
+    if (v && near(v.port) && !(s.status === PORT && s.port >= 0 && app.fleet.portCodes[s.port] === code) && (!v.eta || v.eta > real - 6 * HOUR)) soon.push([v.eta || Infinity, ship, v]);
+    const call = (app.ais.calls.get(ship.id) || []).filter((c) => near(c) && c.from <= t && t - c.to < 7 * DAY && t - c.to > 3 * HOUR).pop();
+    if (call) recent.push([call.to, ship, call]);
   }
-  soon.sort((a, b) => a[0] - b[0]);
+  soon.sort((a, b) => a[0] - b[0]); recent.sort((a, b) => b[0] - a[0]);
   const row = (ship, sub) => `<li><button type="button" data-ship="${ship.id}"><span class="t"><span class="dot" style="background:${app.lines[ship.line].color}"></span>${esc(ship.name)}</span><span class="v">${num(ship.pax)}</span><span class="s">${esc(sub)}</span></button></li>`;
   el().innerHTML = `
     <div class="p-head"><button type="button" class="x" data-close aria-label="Close">×</button>
       <p class="p-line">${esc(p.country)} · port</p><h2 class="p-name">${esc(shortPort(p.name))}</h2>
-      <div class="p-badges"><span class="badge">Local time ${fmtTime(t, p.tz)}</span><span class="badge demo">Demo schedule</span></div></div>
-    <div class="p-sec"><h3>In port together · ${here.length} ${here.length === 1 ? 'ship' : 'ships'} · ${num(here.reduce((a, s) => a + s.pax, 0))} guests</h3>
-      ${here.length ? `<ul class="list">${here.map((s) => row(s, app.lines[s.line].name)).join('')}</ul>` : '<p class="note">No ships alongside at the selected time.</p>'}</div>
-    <div class="p-sec"><h3>Arriving in the next 7 days</h3>
-      ${soon.length ? `<ul class="list">${soon.slice(0, 14).map(([at, s]) => row(s, `${fmtDate(at, p.tz)} ${fmtTime(at, p.tz)} local`)).join('')}</ul>` : '<p class="note">No calls scheduled this week.</p>'}</div>`;
+      <div class="p-badges"><span class="badge">Local time ${fmtTime(t, p.tz)}</span><span class="badge live">From AIS</span></div></div>
+    <div class="p-sec"><h3>Alongside or at anchor · ${here.length} ${here.length === 1 ? 'ship' : 'ships'}</h3>
+      ${here.length ? `<ul class="list">${here.map(([s, src]) => row(s, `${app.lines[s.line].name}${src === SRC.RECENT || src === SRC.LAST ? ' · last heard here' : ''}`)).join('')}</ul>` : '<p class="note">AIS shows none of the tracked ships here at the selected time.</p>'}</div>
+    <div class="p-sec"><h3>Heading here</h3>
+      ${soon.length ? `<ul class="list">${soon.slice(0, 14).map(([eta, s, v]) => row(s, v.eta ? `ETA ${fmtDate(v.eta, p.tz)}${v.etaTimeKnown ? ` ${fmtTime(v.eta, p.tz)} local` : ''}` : `Destination “${v.dest}”`)).join('')}</ul>` : '<p class="note">No tracked ship is broadcasting this port as its destination.</p>'}</div>
+    <div class="p-sec"><h3>Called here in the last week</h3>
+      ${recent.length ? `<ul class="list">${recent.slice(0, 14).map(([, s, c]) => row(s, `${fmtDate(c.from, p.tz)} ${fmtTime(c.from, p.tz)} to ${fmtDate(c.to, p.tz) === fmtDate(c.from, p.tz) ? '' : `${fmtDate(c.to, p.tz)} `}${fmtTime(c.to, p.tz)} local`)).join('')}</ul>` : '<p class="note">No recorded calls yet.</p>'}</div>`;
   el().hidden = false; el().scrollTop = 0; el()._ship = null; el()._port = code;
 }
 
@@ -212,7 +229,6 @@ export function bindPanel(app) {
     const t = e.target.closest('button'); if (!t) return;
     if (t.dataset.close !== undefined) app.clearSelection();
     else if (t.dataset.ship) app.selectShip(t.dataset.ship, { fly: true });
-    else if (t.dataset.goto) { app.pause(); app.setTime(+t.dataset.goto + 2 * 36e5); app.flyToShip(el()._ship); }
     else if (t.dataset.follow !== undefined) { app.setFollow(!app.sel.follow); t.setAttribute('aria-pressed', String(app.sel.follow)); }
     else if (t.dataset.share !== undefined) app.share(t);
   });

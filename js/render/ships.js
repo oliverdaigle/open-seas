@@ -1,6 +1,6 @@
-// Ships, wakes, ports and the selected voyage. One instanced draw call for the whole fleet.
-import { llToVec, densify, D2R } from '../geo.js';
-import { REC, TRAIL, PORT } from '../sim.js';
+// Ships, wakes, ports and the selected ship's track. One instanced draw call for the whole fleet.
+import { llToVec, densify, gcPoint, angle, R2D, D2R } from '../geo.js';
+import { REC, TRAIL, PORT } from '../fleet.js';
 import { SRC } from '../data/ais.js';
 
 const THREE = window.THREE;
@@ -68,28 +68,27 @@ export class ShipLayer {
 
     this.route = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0xffb547, transparent: true, opacity: 0.95, depthWrite: false }));
     this.route.frustumCulled = false; this.route.visible = false; this.route.renderOrder = 10; globe.scene.add(this.route);
-    this.extraRoutes = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x5fd4e6, transparent: true, opacity: 0.55, depthWrite: false }));
+    this.extraRoutes = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({ color: 0x5fd4e6, transparent: true, opacity: 0.8, depthWrite: false }));
     this.extraRoutes.frustumCulled = false; this.extraRoutes.visible = false; this.extraRoutes.renderOrder = 9; globe.scene.add(this.extraRoutes);
     this.m = new THREE.Matrix4();
   }
 
-  // Draw the route of one voyage (amber). Pass null to clear.
-  showVoyage(ship, voyage) {
-    if (!voyage) { this.route.visible = false; return; }
+  // The selected ship: the track it has sailed (amber) and, dashed, the way to the destination it broadcasts (cyan).
+  showTrack(track, from, dest) {
     const pts = [];
-    for (let i = voyage.i0; i < voyage.i1; i++) { const g = ship.stops[i].geom; if (g) for (const p of densify(g.pts, 1.5)) pts.push(...llToVec(p[0], p[1], 1.0009)); }
+    if (track && track.length > 1) for (const p of densify(track, 1)) pts.push(...llToVec(p[0], p[1], 1.0009));
     this.route.geometry.dispose(); this.route.geometry = new THREE.BufferGeometry();
     this.route.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3)); this.route.visible = pts.length > 0;
-  }
-  // Draw several voyages at once (cyan), for "Find me a cruise" results.
-  showVoyages(list) {
-    const pts = [];
-    for (const [ship, voyage] of list.slice(0, 60)) for (let i = voyage.i0; i < voyage.i1; i++) {
-      const g = ship.stops[i].geom; if (!g) continue; const d = densify(g.pts, 2.5);
-      for (let k = 1; k < d.length; k++) pts.push(...llToVec(d[k - 1][0], d[k - 1][1], 1.0007), ...llToVec(d[k][0], d[k][1], 1.0007));
+    const seg = [];
+    if (from && dest && dest.lat !== undefined) {
+      const deg = angle(from[0], from[1], dest.lat, dest.lon) * R2D, n = Math.max(2, Math.ceil(deg / 0.4));
+      for (let i = 0; i < n; i += 2) {
+        const a = gcPoint(from, [dest.lat, dest.lon], i / n), b = gcPoint(from, [dest.lat, dest.lon], Math.min(1, (i + 1) / n));
+        seg.push(...llToVec(a[0], a[1], 1.0009), ...llToVec(b[0], b[1], 1.0009));
+      }
     }
     this.extraRoutes.geometry.dispose(); this.extraRoutes.geometry = new THREE.BufferGeometry();
-    this.extraRoutes.geometry.setAttribute('position', new THREE.Float32BufferAttribute(pts, 3)); this.extraRoutes.visible = pts.length > 0;
+    this.extraRoutes.geometry.setAttribute('position', new THREE.Float32BufferAttribute(seg, 3)); this.extraRoutes.visible = seg.length > 0;
   }
 
   update(buf, modes, opts) {
@@ -97,8 +96,8 @@ export class ShipLayer {
     const size = Math.max(0.00042, Math.min(0.05, dist * 0.0165)), berth = size * 0.42, farPorts = dist > 0.75;
     const tp = this.trailGeo.attributes.position.array, tc = this.trailGeo.attributes.color.array, ic = this.mesh.instanceColor.array;
     const inPort = new Map(); this.portCount.fill(0);
-    for (let k = 0; k < n; k++) if (buf[k * REC + 4] === PORT && modes[k] === SRC.DEMO) {
-      const code = this.fleet.ships[k].stops[buf[k * REC + 7]]?.port; if (!code) continue;
+    for (let k = 0; k < n; k++) if (buf[k * REC + 4] === PORT && buf[k * REC + 7] >= 0) {
+      const code = this.portCodes[buf[k * REC + 7]]; if (!code) continue;
       let l = inPort.get(code); if (!l) inPort.set(code, l = []); l.push(k); this.portCount[this.portIndex.get(code)]++;
     }
     this.inPort = inPort;
@@ -120,12 +119,12 @@ export class ShipLayer {
       Z.copy(F).negate();
       m.makeBasis(Rt, up, Z).scale(new THREE.Vector3(s, s, s)).setPosition(P);
       this.mesh.setMatrixAt(k, m);
-      const c = this.colors[k], f = dim ? 0.22 : modes[k] === SRC.STALE ? 0.5 : 1;
+      const c = this.colors[k], f = dim ? 0.22 : modes[k] === SRC.LAST ? 0.38 : modes[k] === SRC.RECENT ? 0.65 : 1;
       ic[k * 3] = c.r * f; ic[k * 3 + 1] = c.g * f; ic[k * 3 + 2] = c.b * f;
       // screen position for picking and labels
       if (s > 0 && P.dot(cam) > 1.0) { proj.copy(P).project(globe.camera); sc[k * 3] = (proj.x * 0.5 + 0.5) * w; sc[k * 3 + 1] = (-proj.y * 0.5 + 0.5) * h; sc[k * 3 + 2] = proj.z < 1 ? 1 : 0; } else sc[k * 3 + 2] = 0;
       // wake
-      const bright = status === 2 && !dim ? (opts.trails ? 1 : 0) : 0;
+      const bright = status === 2 && !dim && modes[k] !== SRC.LAST && modes[k] !== SRC.RECENT ? (opts.trails ? 1 : 0) : 0;
       let px = P.x, py = P.y, pz = P.z;
       for (let j = 0; j < TRAIL; j++) {
         llToVec(buf[b + 8 + j * 2], buf[b + 9 + j * 2], R_SHIP - 0.0003, v);

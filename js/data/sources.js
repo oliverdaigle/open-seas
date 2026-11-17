@@ -1,8 +1,8 @@
 // One place that knows the state of every data source. The "Data sources" panel renders this.
 const sources = new Map(), listeners = new Set();
-export const MODES = { demo: 'Demo', live: 'Live', error: 'Error', off: 'Off' };
+export const MODES = { live: 'Live', waiting: 'Waiting', demo: 'Modelled', error: 'Unavailable', off: 'Off' };
 
-export function defineSource(id, label, provides) { sources.set(id, { id, label, provides, mode: 'demo', detail: '', updated: null }); }
+export function defineSource(id, label, provides) { sources.set(id, { id, label, provides, mode: 'waiting', detail: '', updated: null }); }
 export function setSource(id, mode, detail = '', updated = Date.now()) {
   const s = sources.get(id); if (!s) return;
   Object.assign(s, { mode, detail, updated });
@@ -12,9 +12,8 @@ export const getSources = () => [...sources.values()];
 export const getSource = (id) => sources.get(id);
 export const onSourceChange = (fn) => listeners.add(fn);
 
-defineSource('ais', 'Ship positions', 'AISStream.io, collected every 20 minutes');
-defineSource('itineraries', 'Itineraries', 'Schedules for past and future sailings');
-defineSource('prices', 'Cabin prices', 'Sample fares');
+defineSource('ais', 'Ship positions', 'AIS reports from AISStream.io, collected every 20 minutes');
+defineSource('voyages', 'Destinations and ETAs', 'Broadcast by each ship over AIS');
 defineSource('wind', 'Wind, cloud and rain grid', 'Open-Meteo forecast');
 defineSource('marine', 'Waves and sea temperature', 'Open-Meteo Marine');
 defineSource('clouds', 'Cloud imagery', 'NASA GIBS (VIIRS true colour)');

@@ -1,6 +1,7 @@
 // Open Seas live-data collector. GitHub Actions runs it every 20 minutes (.github/workflows/live.yml)
 // and deploys the site with the files it writes to data/live/:
-//   ais.json       AISStream.io positions for the ships in data/ships.json   needs AISSTREAM_API_KEY
+//   ais.json       AISStream.io positions, broadcast destinations and port calls for the ships in
+//                  data/ships.json                                          needs AISSTREAM_API_KEY
 //   forecast.json  Open-Meteo wind, cloud and rain grid                     refreshed every 3 hours
 //   marine.json    Open-Meteo waves and sea-surface temperature grid        refreshed every 3 hours
 //   storms.json    NOAA National Hurricane Center active storms             every run
@@ -20,8 +21,6 @@ const LISTEN_S = Number(process.env.AIS_SECONDS || 240);
 const DEBUG_AIS = !!process.env.DEBUG_AIS;
 const FORCE_WEATHER = !!process.env.FORCE_WEATHER;
 const MIN = 6e4, HOUR = 36e5;
-const KEEP_MS = 24 * HOUR;          // ping history kept per ship
-const STEP_MS = 2 * MIN;            // at most one stored ping per ship every two minutes
 const WX_EVERY = 3 * HOUR - 15 * MIN;
 const GX = 18, GY = 11;             // weather grid: every 20 degrees of longitude, 15 of latitude (matches js/data/weather.js)
 
@@ -97,12 +96,93 @@ async function storms() {
 }
 
 // ---------------------------------------------------------------- ships (AIS)
+// ais.json, schema 2. For every ship AIS has heard in the last 30 days:
+//   track   [[t, lat, lon, sog, cog, hdg, nav], ...]  every ping from the last 24 h, one per 30 min back
+//           to 7 days, and always the newest ping (so a ship seen 3 weeks ago keeps its last position)
+//   voyage  what the ship itself broadcasts: destination text, the port it decodes to, ETA, draught
+//   calls   port calls detected from the track (moored or stopped next to a port)
 const norm = (s) => (s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 const PASSENGER = (type) => type >= 60 && type <= 69;
+const KEEP_ALL = 24 * HOUR, KEEP_TRACK = 7 * 864e5, KEEP_LAST = 30 * 864e5, THIN = 30 * MIN;
+const NM = 3440.065, D2R = Math.PI / 180;
+const distNm = (a, b, c, d) => {
+  const p1 = a * D2R, p2 = c * D2R, h = Math.sin((p2 - p1) / 2) ** 2 + Math.cos(p1) * Math.cos(p2) * Math.sin(((d - b) * D2R) / 2) ** 2;
+  return 2 * NM * Math.asin(Math.min(1, Math.sqrt(h)));
+};
 // AISStream times look like "2026-11-17 14:15:16.123456789 +0000 UTC"
 function aisTime(s) {
   const m = /^(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d:\d\d)(\.\d{1,3})?/.exec(s || '');
   return (m && Date.parse(`${m[1]}T${m[2]}${m[3] || ''}Z`)) || Date.now();
+}
+// AIS ETA has month, day, hour and minute (UTC) but no year: take the occurrence nearest to now.
+function etaTime(e, now) {
+  if (!e || !(e.Month >= 1 && e.Month <= 12) || !(e.Day >= 1 && e.Day <= 31)) return null;
+  const timeKnown = e.Hour >= 0 && e.Hour <= 23 && e.Minute >= 0 && e.Minute <= 59, y = new Date(now).getUTCFullYear();
+  const at = (yy) => Date.UTC(yy, e.Month - 1, e.Day, timeKnown ? e.Hour : 12, timeKnown ? e.Minute : 0);
+  const t = [at(y - 1), at(y), at(y + 1)].sort((a, b) => Math.abs(a - now) - Math.abs(b - now))[0];
+  return { t, timeKnown };
+}
+
+// Port lookup: the site's own cruise ports (with coordinates) first, then UN/LOCODE seaports.
+async function portBook() {
+  const cruise = JSON.parse(await readFile(new URL('data/ports.json', ROOT), 'utf8'));
+  const sea = JSON.parse(await readFile(new URL('data/seaports.json', ROOT), 'utf8'));
+  const byName = new Map(), add = (key, p) => { if (!key) return; const l = byName.get(key) || []; l.push(p); byName.set(key, l); };
+  const cruiseList = Object.entries(cruise).map(([id, p]) => ({ id, name: p.name.split(/[,(]/)[0].trim(), country: p.country, lat: p.lat, lon: p.lon, cruise: true }));
+  for (const p of cruiseList) {
+    const full = cruise[p.id].name;
+    add(norm(p.name), p);
+    for (const alt of (full.match(/\(([^)]+)\)/) || [])[1]?.split('/') || []) add(norm(alt), p);   // "Cape Liberty (Bayonne)"
+    for (const alt of full.split(/,| at /).slice(1)) add(norm(alt.replace(/\(.*\)/, '')), p);         // "Perfect Day at CocoCay", "George Town, Grand Cayman"
+  }
+  // Two-letter country codes for the site's cruise ports, so "BS CCY" can find CocoCay by its code.
+  const ISO = { US: 'USA', BS: 'Bahamas', ES: 'Spain', IT: 'Italy', JP: 'Japan', GR: 'Greece', AU: 'Australia', MX: 'Mexico', GB: 'United Kingdom', NZ: 'New Zealand', NO: 'Norway',
+    FR: 'France', CA: 'Canada', PT: 'Portugal', HR: 'Croatia', TR: 'Türkiye', IE: 'Ireland', DE: 'Germany', MY: 'Malaysia', TH: 'Thailand', KR: 'South Korea', NC: 'New Caledonia',
+    VU: 'Vanuatu', BM: 'Bermuda', HN: 'Honduras', BZ: 'Belize', KY: 'Cayman Islands', JM: 'Jamaica', DO: 'Dominican Republic', TC: 'Turks and Caicos', PR: 'Puerto Rico',
+    VI: 'US Virgin Islands', VG: 'British Virgin Islands', SX: 'Sint Maarten', KN: 'St. Kitts and Nevis', AG: 'Antigua and Barbuda', GP: 'Guadeloupe', MQ: 'Martinique',
+    LC: 'St. Lucia', BB: 'Barbados', AW: 'Aruba', CW: 'Curaçao', BQ: 'Bonaire', GI: 'Gibraltar', MC: 'Monaco', MT: 'Malta', ME: 'Montenegro', MA: 'Morocco', NL: 'Netherlands',
+    DK: 'Denmark', PL: 'Poland', SE: 'Sweden', FI: 'Finland', EE: 'Estonia', SG: 'Singapore', VN: 'Vietnam', TW: 'Taiwan', CN: 'China' };
+  for (const [code, [name, lat, lon]] of Object.entries(sea)) if (lat !== undefined) add(norm(name), { code, name, country: code.slice(0, 2), lat, lon });
+  const nearest = (list, lat, lon) => list.slice().sort((a, b) => distNm(lat, lon, a.lat, a.lon) - distNm(lat, lon, b.lat, b.lon))[0];
+  // A destination string as crews type it: "GIGIB", "US MIA", "ESAGP<>ESMLN", "PIRAEUS GRE", "MIAMI>NASSAU".
+  function resolve(raw, lat, lon) {
+    const s = String(raw || '').toUpperCase().replace(/\s+/g, ' ').trim();
+    if (!s || /^(X+|N\/?A|NONE|NIL|TBA|TBN|FOR SALE|[.\-_ ]+)$/.test(s)) return null;
+    // "FROM>TO": only the last leg is the destination. If it can't be decoded, show what the crew typed.
+    const part = s.split(/<>|=>|>|\/|\bTO\b|\bVIA\b|\s-\s/).map((p) => p.replace(/[^A-Z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean).pop();
+    if (!part) return null;
+    {
+      const m = /^([A-Z]{2}) ?([A-Z2-9]{3})$/.exec(part);
+      const own = m && cruise[m[2]] && cruise[m[2]].country === ISO[m[1]] ? cruise[m[2]] : null;
+      if (own) return { code: m[1] + m[2], name: own.name.split(/[,(]/)[0].trim(), country: m[1], lat: own.lat, lon: own.lon };
+      if (m && sea[m[1] + m[2]]) {
+        const code = m[1] + m[2], [name, plat, plon] = sea[code];
+        const known = (byName.get(norm(name)) || []).filter((p) => p.cruise || p.code === code);
+        const best = known.length ? nearest(known, plat ?? lat, plon ?? lon) : null;
+        const pl = plat ?? best?.lat, po = plon ?? best?.lon;
+        return { code, name, country: code.slice(0, 2), ...(pl !== undefined ? { lat: pl, lon: po } : {}) };
+      }
+      const words = part.split(' ');
+      for (let k = words.length; k >= 1; k--) {
+        const list = byName.get(words.slice(0, k).join(''));
+        if (!list) continue;
+        const best = nearest(list, lat, lon);
+        if (distNm(lat, lon, best.lat, best.lon) > 6500) continue;
+        return { ...(best.code ? { code: best.code } : {}), name: best.name, country: best.country, lat: best.lat, lon: best.lon };
+      }
+    }
+    return { name: part, unresolved: true };
+  }
+  // The port a stopped ship is lying at, if any.
+  function at(lat, lon) {
+    let best = null, bd = 6;
+    for (const p of cruiseList) { const d = distNm(lat, lon, p.lat, p.lon); if (d < bd) { bd = d; best = p; } }
+    if (best) return best;
+    bd = 3;
+    for (const [code, [name, plat, plon]] of Object.entries(sea)) { if (plat === undefined || Math.abs(plat - lat) > 0.1) continue; const d = distNm(lat, lon, plat, plon); if (d < bd) { bd = d; best = { code, name, country: code.slice(0, 2), lat: plat, lon: plon }; } }
+    return best;
+  }
+  return { resolve, at };
 }
 
 // Listen to the worldwide AISStream feed for `seconds`, passing every message to onMessage.
@@ -135,53 +215,78 @@ function listen(onMessage, seconds) {
   });
 }
 
+// Group stopped pings next to the same port into calls: [{ name, code?, country, lat, lon, from, to }].
+function detectCalls(track, ports) {
+  const calls = [];
+  for (const [t, lat, lon, sog, , , nav] of track) {
+    if (!(nav === 5 || nav === 1 || sog < 0.6)) continue;
+    const p = ports.at(lat, lon); if (!p) continue;
+    const last = calls[calls.length - 1];
+    if (last && last.name === p.name && t - last.to < 8 * HOUR) last.to = t;
+    else calls.push({ name: p.name, ...(p.code ? { code: p.code } : {}), ...(p.id ? { port: p.id } : {}), country: p.country, lat: p.lat, lon: p.lon, from: t, to: t });
+  }
+  return calls;
+}
+function mergeCalls(old = [], fresh = []) {
+  const out = old.map((c) => ({ ...c }));
+  for (const c of fresh) {
+    const same = out.find((o) => o.name === c.name && c.from - o.to < 8 * HOUR && o.from - c.to < 8 * HOUR);
+    if (same) { same.from = Math.min(same.from, c.from); same.to = Math.max(same.to, c.to); } else out.push(c);
+  }
+  return out.sort((a, b) => a.from - b.from).filter((c) => Date.now() - c.to < KEEP_LAST).slice(-15);
+}
+function thin(track, now) {
+  const out = []; let lastKept = -Infinity;
+  track.forEach((p, i) => {
+    const age = now - p[0], newest = i === track.length - 1;
+    if (newest ? age < KEEP_LAST : age < KEEP_ALL) { out.push(p); lastKept = p[0]; }
+    else if (age < KEEP_TRACK && p[0] - lastKept >= THIN) { out.push(p); lastKept = p[0]; }
+  });
+  return out;
+}
+
 async function ais() {
   const ships = JSON.parse(await readFile(new URL('data/ships.json', ROOT), 'utf8'));
   const byId = new Map(ships.map((s) => [s.id, s])), byName = new Map(ships.map((s) => [norm(s.name), s]));
   const byImo = new Map(ships.filter((s) => s.imo).map((s) => [s.imo, s]));
+  const ports = await portBook();
   const prev = await previous('ais.json');
-  const now = Date.now(), base = { schema: 1, generatedAt: new Date(now).toISOString() };
+  const prevShips = prev?.schema === 2 ? prev.ships || {} : {};
+  const now = Date.now();
 
-  // MMSI -> { id, by } where by is 'imo' (IMO number matched), 'type' (name matched and the vessel
-  // says it carries passengers) or 'name' (name only). blocked: MMSIs known to be namesakes.
+  // MMSI -> { id, by }: 'imo' (IMO number matched), 'type' (name matched and the vessel says it carries
+  // passengers) or 'name' (name only). blocked: MMSIs known to be namesakes.
   const mmsi = new Map(Object.entries(prev?.mmsi || {}).filter(([, m]) => byId.has(m.id)));
   const blocked = new Set(prev?.blocked || []);
   const strongFor = (id) => [...mmsi.entries()].find(([, m]) => m.id === id && m.by !== 'name');
   const anyFor = (id) => [...mmsi.entries()].find(([, m]) => m.id === id);
   const drop = (mm) => { mmsi.delete(mm); blocked.add(mm); };
 
-  const pings = new Map(), stats = { messages: 0, positions: 0, staticReports: 0, matchedPositions: 0, emptyNames: 0 };
-  const dbg = new Map(), CRUISY = /OF THE SEAS|CARNIVAL|^MSC |NORWEGIAN|PRINCESS|CELEBRITY|VIKING|DISNEY|AIDA|COSTA|QUEEN|VIRGIN|SEABOURN|SILVER|SEVEN SEAS|REGATTA|EXPLORA|RITZ|ODYSSEY|NIEUW|ROTTERDAM|EURODAM|KONINGSDAM/;
+  const pings = new Map(), statics = new Map(), stats = { messages: 0, positions: 0, staticReports: 0, matchedPositions: 0, emptyNames: 0 };
+  const dbg = new Map();
   const onMessage = (m) => {
     stats.messages++;
     const meta = m.MetaData || {}, mm = String(meta.MMSI ?? '');
     if (m.MessageType === 'PositionReport' && !String(meta.ShipName || '').trim()) stats.emptyNames++;
-    if (DEBUG_AIS) {
-      const name = String(meta.ShipName || '').trim(), sd = m.Message?.ShipStaticData;
-      if ((sd && PASSENGER(+sd.Type)) || CRUISY.test(name.toUpperCase())) {
-        const d = dbg.get(mm) || { mmsi: mm, name, n: 0 }; d.n++;
-        if (sd) Object.assign(d, { imo: sd.ImoNumber, type: sd.Type, dest: sd.Destination, eta: sd.Eta, callSign: sd.CallSign });
-        if (meta.latitude !== undefined) Object.assign(d, { lat: meta.latitude, lon: meta.longitude });
-        d.matched = byName.has(norm(name)) ? byName.get(norm(name)).id : null; dbg.set(mm, d);
-      }
-    }
     if (!mm || blocked.has(mm)) return;
     if (m.MessageType === 'ShipStaticData') {
       stats.staticReports++;
       const sd = m.Message?.ShipStaticData || {}, imo = +sd.ImoNumber || 0, type = +sd.Type || 0;
+      if (DEBUG_AIS && PASSENGER(type)) dbg.set(mm, { mmsi: mm, name: String(sd.Name || meta.ShipName || '').trim(), imo, type, dest: sd.Destination });
       const imoShip = imo && byImo.get(imo);
       if (imoShip) {                                   // an IMO match beats any name match
         for (const [k, v] of mmsi) if (v.id === imoShip.id && k !== mm) mmsi.delete(k);
         mmsi.set(mm, { id: imoShip.id, by: 'imo' });
-        return;
+      } else {
+        const cur = mmsi.get(mm), ship = cur ? byId.get(cur.id) : byName.get(norm(sd.Name || meta.ShipName));
+        if (!ship) return;
+        if ((ship.imo && imo && imo !== ship.imo) || (type && !PASSENGER(type))) { if (cur) drop(mm); return; }   // a namesake
+        if (PASSENGER(type) && !strongFor(ship.id)) {
+          for (const [k, v] of mmsi) if (v.id === ship.id && k !== mm) mmsi.delete(k);
+          mmsi.set(mm, { id: ship.id, by: 'type' });
+        }
       }
-      const cur = mmsi.get(mm), ship = cur ? byId.get(cur.id) : byName.get(norm(sd.Name || meta.ShipName));
-      if (!ship) return;
-      if ((ship.imo && imo && imo !== ship.imo) || (type && !PASSENGER(type))) { if (cur) drop(mm); return; }   // a namesake
-      if (PASSENGER(type) && !strongFor(ship.id)) {
-        for (const [k, v] of mmsi) if (v.id === ship.id && k !== mm) mmsi.delete(k);
-        mmsi.set(mm, { id: ship.id, by: 'type' });
-      }
+      if (mmsi.has(mm)) statics.set(mm, { at: aisTime(meta.time_utc), dest: String(sd.Destination || '').trim(), eta: sd.Eta, draught: sd.MaximumStaticDraught, callSign: String(sd.CallSign || '').trim() });
       return;
     }
     if (m.MessageType !== 'PositionReport') return;
@@ -196,12 +301,12 @@ async function ais() {
     const lat = pr.Latitude ?? meta.latitude, lon = pr.Longitude ?? meta.longitude;
     if (!(Math.abs(lat) <= 90) || !(Math.abs(lon) <= 180) || (lat === 0 && lon === 0)) return;
     const sog = pr.Sog >= 0 && pr.Sog < 102.3 ? pr.Sog : 0, cog = pr.Cog >= 0 && pr.Cog < 360 ? pr.Cog : 0;
-    const hdg = pr.TrueHeading >= 0 && pr.TrueHeading < 360 ? pr.TrueHeading : cog;
-    const p = [aisTime(meta.time_utc), +lat.toFixed(5), +lon.toFixed(5), +sog.toFixed(1), +cog.toFixed(1), hdg, mm];
+    const hdg = pr.TrueHeading >= 0 && pr.TrueHeading < 360 ? pr.TrueHeading : cog, nav = pr.NavigationalStatus ?? 15;
+    const p = [aisTime(meta.time_utc), +lat.toFixed(5), +lon.toFixed(5), +sog.toFixed(1), +cog.toFixed(1), hdg, nav, mm];
     let list = pings.get(entry.id); if (!list) pings.set(entry.id, list = []);
     const last = list[list.length - 1];
-    if (last && p[0] <= last[0] && last[6] === mm) return;
-    if (last && last[6] === mm && list.length > 1 && p[0] - list[list.length - 2][0] < STEP_MS) list[list.length - 1] = p;
+    if (last && p[0] <= last[0] && last[7] === mm) return;
+    if (last && last[7] === mm && list.length > 1 && p[0] - list[list.length - 2][0] < 2 * MIN) list[list.length - 1] = p;
     else list.push(p);
     stats.matchedPositions++;
   };
@@ -209,32 +314,39 @@ async function ais() {
   let result = { opened: false, error: 'No AISStream key has been added to the repository yet' };
   if (KEY) { log(`AIS: listening for ${LISTEN_S} s`); result = await listen(onMessage, LISTEN_S); }
 
-  // Merge with the deployed history. Old pings survive only if their vessel is still assigned to the ship.
-  const owner = (id) => anyFor(id)?.[0];
-  const tracks = {}, from = {};
+  // Merge with the deployed copy. Old data survives only while its vessel is still assigned to the ship.
+  const out = {};
   for (const ship of ships) {
-    const id = ship.id, mm = owner(id);
-    const old = prev?.tracks?.[id] && prev.from?.[id] && prev.from[id] === mm ? prev.tracks[id] : [];
-    const fresh = (pings.get(id) || []).filter((p) => p[6] === mm).map((p) => p.slice(0, 6));
-    const all = new Map([...old, ...fresh].filter((p) => now - p[0] < KEEP_MS).map((p) => [p[0], p]));
-    if (!all.size) continue;
-    tracks[id] = [...all.values()].sort((a, b) => a[0] - b[0]); from[id] = mm;
+    const id = ship.id, mm = anyFor(id)?.[0], old = prevShips[id] && prevShips[id].mmsi === mm ? prevShips[id] : null;
+    const fresh = (pings.get(id) || []).filter((p) => p[7] === mm).map((p) => p.slice(0, 7));
+    const byT = new Map([...(old?.track || []), ...fresh].map((p) => [p[0], p]));
+    const track = thin([...byT.values()].sort((a, b) => a[0] - b[0]), now);
+    if (!track.length) continue;
+    const last = track[track.length - 1];
+    const st = mm && statics.get(mm);
+    let voyage = old?.voyage || null;
+    if (st) {
+      const eta = etaTime(st.eta, now);
+      voyage = { dest: st.dest, at: st.at, port: ports.resolve(st.dest, last[1], last[2]), ...(eta ? { eta: eta.t, etaTimeKnown: eta.timeKnown } : {}),
+        ...(st.draught > 0 ? { draught: st.draught } : {}), ...(st.callSign ? { callSign: st.callSign } : {}) };
+    }
+    const calls = mergeCalls(old?.calls, detectCalls(fresh.length ? track.filter((p) => p[0] >= fresh[0][0] - 8 * HOUR) : [], ports));
+    out[id] = { mmsi: mm, by: mmsi.get(mm)?.by, track, ...(voyage ? { voyage } : {}), ...(calls.length ? { calls } : {}) };
   }
-  const seenNow = [...pings.keys()].filter((id) => tracks[id]?.some((p) => now - p[0] < LISTEN_S * 1000 + MIN));
+  const heardNow = [...pings.keys()].filter((id) => out[id]?.track.some((p) => now - p[0] < LISTEN_S * 1000 + MIN));
   const ok = !!KEY && result.opened && !(result.error && stats.messages === 0);
   const data = {
-    ...base, status: !KEY ? 'no-key' : ok ? 'ok' : 'error', ...(ok ? {} : { error: result.error || 'AISStream sent no data' }),
-    window: { seconds: KEY ? LISTEN_S : 0 }, stats: { ...stats, shipsSeen: seenNow.length },
-    mmsi: Object.fromEntries(mmsi), blocked: [...blocked], from, tracks,
+    schema: 2, generatedAt: new Date(now).toISOString(), status: !KEY ? 'no-key' : ok ? 'ok' : 'error', ...(ok ? {} : { error: result.error || 'AISStream sent no data' }),
+    window: { seconds: KEY ? LISTEN_S : 0 }, stats: { ...stats, shipsHeard: heardNow.length, shipsKnown: Object.keys(out).length },
+    mmsi: Object.fromEntries(mmsi), blocked: [...blocked], ships: out,
   };
   await save('ais.json', data);
   if (DEBUG_AIS) {
-    const rows = [...dbg.values()].sort((a, b) => b.n - a.n);
-    await save('ais-debug.json', rows);
-    log(`AIS debug: ${rows.length} passenger or cruise-named vessels, ${stats.emptyNames} position reports without a name`);
-    for (const r of rows.slice(0, 80)) log(`  ${r.mmsi} ${JSON.stringify(r.name)} type=${r.type ?? '?'} imo=${r.imo ?? '?'} dest=${JSON.stringify(r.dest ?? '')} matched=${r.matched ?? '-'} n=${r.n}`);
+    log(`AIS debug: ${dbg.size} passenger vessels sent static data`);
+    for (const r of [...dbg.values()].slice(0, 120)) log(`  ${r.mmsi} ${JSON.stringify(r.name)} type=${r.type} imo=${r.imo} dest=${JSON.stringify(r.dest || '')}`);
   }
-  return { ok, at: now, error: data.error, note: `${stats.messages} messages, ${seenNow.length} of ${ships.length} ships seen: ${seenNow.map((id) => byId.get(id).name).join(', ') || 'none'}` };
+  const names = heardNow.map((id) => { const v = out[id].voyage; return `${byId.get(id).name}${v ? ` -> ${v.port?.name || JSON.stringify(v.dest)}` : ''}`; });
+  return { ok, at: now, error: data.error, note: `${stats.messages} messages, ${heardNow.length} heard now, ${Object.keys(out).length} of ${ships.length} known: ${names.join('; ') || 'none'}` };
 }
 
 // ---------------------------------------------------------------- run

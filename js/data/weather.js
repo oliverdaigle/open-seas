@@ -2,8 +2,8 @@
 //   Live  Open-Meteo (forecast + marine), NASA GIBS, RainViewer, NOAA NHC. All keyless.
 //         The GitHub Action also saves the Open-Meteo grids and NHC storms to data/live/, so every
 //         visitor shares one fresh copy and the page still works where the APIs can't be reached.
-//   Demo  a modelled climatology and one simulated storm, used per source whenever a request fails,
-//         you are offline, or the selected time is outside what the live source covers.
+//   Fallback  a modelled climatology for wind, cloud, waves and sea temperature, used only when a feed
+//         fails or the selected time is outside what it covers. It is labelled as modelled wherever it shows.
 import { CONFIG } from '../config.js';
 import { getJSON, setSource } from './sources.js';
 import { angle, bearing, destination, D2R, R2D, NM_PER_RAD } from '../geo.js';
@@ -36,14 +36,13 @@ export function climate(lat, lon, t, o = {}) {
 
 export class Weather {
   constructor() {
-    this.forecast = null; this.marine = null; this.liveStorms = null; this.demoStorms = []; this.radar = null;
+    this.forecast = null; this.marine = null; this.liveStorms = null; this.radar = null;
     this._o = {}; this.listeners = new Set();
   }
   onChange(fn) { this.listeners.add(fn); }
   emit() { this.listeners.forEach((f) => f()); }
 
   async start() {
-    try { const d = await getJSON(`${CONFIG.DATA_BASE}weather.demo.json`); this.demoStorms = d.storms.map((s) => ({ ...s, track: s.track.map((p) => ({ ...p, t: Date.parse(p.t) })) })); } catch {}
     const demo = (id, why) => setSource(id, 'demo', why);
     if (!CONFIG.LIVE_WEATHER) { ['wind', 'marine', 'clouds', 'radar', 'storms'].forEach((id) => demo(id, 'Live weather is switched off in js/config.js. Using modelled climatology.')); return; }
     ['wind', 'marine', 'clouds', 'radar', 'storms'].forEach((id) => demo(id, 'Loading…'));
@@ -158,7 +157,7 @@ export class Weather {
       } catch {}
     }
     this._st = null;                 // drop storms cached before the feed answered
-    if (!list) { this.liveStorms = null; setSource('storms', 'demo', 'NHC feed unreachable. Showing one simulated storm, clearly labelled.'); this.emit(); return; }
+    if (!list) { this.liveStorms = null; setSource('storms', 'error', 'The NHC feed could not be reached, so no storms are shown.'); this.emit(); return; }
     this.liveStorms = list;
     setSource('storms', 'live', `${how} ${list.length ? `${list.length} active: ${list.map((st) => st.name).join(', ')}. Cones are projected from current motion, not the official NHC cone.` : 'No active tropical cyclones in the Atlantic or eastern Pacific.'}`, at);
     this.emit();
@@ -173,13 +172,6 @@ export class Weather {
         const at = (h) => { const p = destination(s.lat, s.lon, s.dir, s.speedKt * h); return { h: h - Math.max(0, dt), lat: p[0], lon: p[1], kt: s.kt }; };
         const now = at(Math.max(0, dt)), fc = []; for (let h = 12; h <= 120; h += 12) fc.push({ ...at(Math.max(0, dt) + h), h });
         out.push({ id: s.id, name: s.name, simulated: false, lat: now.lat, lon: now.lon, kt: s.kt, forecast: fc });
-      }
-    } else {
-      for (const s of this.demoStorms) {
-        const tr = s.track; if (t < tr[0].t || t > tr[tr.length - 1].t) continue;
-        const at = (tt) => { let i = 0; while (i < tr.length - 2 && tr[i + 1].t <= tt) i++; const a = tr[i], b = tr[i + 1], f = clamp((tt - a.t) / (b.t - a.t), 0, 1); return { lat: a.lat + (b.lat - a.lat) * f, lon: a.lon + (b.lon - a.lon) * f, kt: a.kt + (b.kt - a.kt) * f }; };
-        const fc = []; for (let h = 12; h <= 120; h += 12) if (t + h * HOUR <= tr[tr.length - 1].t) fc.push({ h, ...at(t + h * HOUR) });
-        out.push({ id: s.id, name: s.name, simulated: true, ...at(t), forecast: fc });
       }
     }
     this._st = out; this._stT = t; return out;

@@ -1,148 +1,143 @@
-// AISAdapter: where ships actually are.
-//   Demo  positions computed from itineraries in a web worker (DemoAISAdapter)
-//   Live  AISStream.io pings collected every 20 minutes by GitHub Actions into data/live/ais.json,
-//         plus, optionally, a real-time relay set in CONFIG.AIS_PROXY_URL (LiveAISAdapter)
-// Every live ping is also written to IndexedDB, so real history builds up for the timeline to replay.
+// Where ships are, and where they say they are going. Everything here comes from AIS:
+//   data/live/ais.json   collected every 20 minutes by GitHub Actions from AISStream.io (tools/collect.mjs):
+//                        position pings, the destination and ETA each ship broadcasts, detected port calls
+//   CONFIG.AIS_PROXY_URL optional real-time relay, merged in when set
+//   IndexedDB            every ping this browser has seen, so the timeline can replay further back
+// A ship AIS has not heard is not drawn. Nothing is simulated.
 import { CONFIG } from '../config.js';
-import { buildFleet, packStates, REC, TRAIL, SEA, PORT } from '../sim.js';
-import { destination, gcPoint } from '../geo.js';
+import { destination, gcPoint, distNm } from '../geo.js';
 import { getJSON, setSource } from './sources.js';
+import { REC, TRAIL, PORT, SEA } from '../fleet.js';
 
-export const SRC = { DEMO: 0, LIVE: 1, ESTIMATED: 2, STALE: 3, RECORDED: 4 };
-export const SRC_LABEL = ['Demo', 'Live', 'Estimated', 'Stale', 'Recorded'];
-const MIN = 6e4;
-
-export class DemoAISAdapter {
-  constructor(data, fleet) {
-    this.fleet = fleet; this.buf = packStates(fleet, Date.now(), 3 * 36e5); this.t = 0; this.busy = false; this.worker = null;
-    try {
-      this.worker = new Worker(new URL('../sim.worker.js', import.meta.url), { type: 'module' });
-      this.worker.onmessage = (e) => { if (e.data.type === 'state') { this.buf = e.data.buf; this.t = e.data.t; this.busy = false; } };
-      this.worker.onerror = () => { this.worker = null; this.busy = false; };
-      this.worker.postMessage({ type: 'init', data: { ships: data.ships, ports: data.ports, templates: data.templates, sailings: data.sailings, routes: data.routes } });
-    } catch { this.worker = null; }
-  }
-  // Ask for the fleet at time t. The answer lands in this.buf, at most a frame later.
-  request(t, trailMs) {
-    if (!this.worker) { this.buf = packStates(this.fleet, t, trailMs, this.buf); this.t = t; return; }
-    if (this.busy) return;
-    this.busy = true; this.worker.postMessage({ type: 'tick', t, trailMs });
-  }
-}
-
+export const SRC = { NONE: 0, LIVE: 1, ESTIMATED: 2, RECENT: 3, RECORDED: 4, LAST: 5 };
+export const SRC_LABEL = ['', 'Live', 'Estimated', 'Recent', 'Recorded', 'Last known'];
+export const NAV = { 0: 'Under way', 1: 'At anchor', 2: 'Not under command', 3: 'Restricted manoeuvrability', 5: 'Moored', 8: 'Under way, sailing' };
+const MIN = 6e4, HOUR = 36e5, DAY = 864e5;
 const norm = (s) => (s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+export const stopped = (p) => p.nav === 5 || p.nav === 1 || p.sog < 0.6;
 
-export class LiveAISAdapter {
+export class AIS {
   constructor(fleet) {
-    this.fleet = fleet; this.tracks = new Map(); this.byMmsi = new Map(); this.byName = new Map(); this.byImo = new Map();
-    this.lastMsg = 0; this.count = 0; this.ws = null; this.db = null; this.retry = 2000;
+    this.fleet = fleet; this.tracks = new Map(); this.voyages = new Map(); this.calls = new Map(); this.info = new Map();
+    this.byMmsi = new Map(); this.byName = new Map(); this.byImo = new Map(); this.portCache = new Map();
+    this.generatedAt = 0; this.ws = null; this.db = null; this.retry = 2000;
     for (const s of fleet.ships) { this.byName.set(norm(s.name), s); if (s.imo) this.byImo.set(s.imo, s); }
   }
   async start() {
     await this.openDb().catch(() => {});
     await this.loadRecorded().catch(() => {});
-    try { const m = await getJSON(`${CONFIG.DATA_BASE}mmsi.json`, 8000); for (const [mmsi, id] of Object.entries(m)) { const s = this.fleet.byId.get(id); if (s) this.byMmsi.set(String(mmsi), s); } } catch {}
-    const snap = await this.loadSnapshot();
+    const ok = await this.loadSnapshot();
     setInterval(() => this.loadSnapshot(), 5 * MIN);
     if (CONFIG.AIS_PROXY_URL) this.connect();
-    else if (!snap) setSource('ais', 'demo', 'No live positions collected yet. Ships follow demo itineraries.');
+    else if (!ok) setSource('ais', 'waiting', 'No positions collected yet. The collector runs every 20 minutes.');
   }
-  // Positions gathered by the GitHub Action. Returns true when the file had any.
+
+  // ---- the collected snapshot ----
   async loadSnapshot() {
     let j;
     try { j = await getJSON(`${CONFIG.LIVE_BASE}ais.json?v=${Math.floor(Date.now() / MIN)}`, 15000); } catch { return false; }
-    if (!j || !j.tracks) return false;
-    for (const [mmsi, m] of Object.entries(j.mmsi || {})) { const s = this.fleet.byId.get(m.id ?? m); if (s) this.byMmsi.set(String(mmsi), s); }
-    for (const [id, pings] of Object.entries(j.tracks)) {
-      if (!this.fleet.byId.has(id) || !pings.length) continue;
-      let tr = this.tracks.get(id); if (!tr) this.tracks.set(id, tr = []);
-      const have = new Set(tr.map((p) => p.t)); let added = false;
-      for (const [t, lat, lon, sog, cog, hdg] of pings) {
-        if (have.has(t) || !(Math.abs(lat) <= 90) || !(Math.abs(lon) <= 180)) continue;
-        const p = { t, lat, lon, sog, cog, hdg }; tr.push(p); this.record(id, p); added = true;
-      }
-      if (added) tr.sort((a, b) => a.t - b.t);
+    if (!j || j.schema !== 2 || !j.ships) return false;
+    const at = Date.parse(j.generatedAt) || Date.now(); this.generatedAt = at; this.status = j.status;
+    for (const [mmsi, m] of Object.entries(j.mmsi || {})) { const s = this.fleet.byId.get(m.id); if (s) this.byMmsi.set(String(mmsi), s); }
+    for (const [id, d] of Object.entries(j.ships)) {
+      if (!this.fleet.byId.has(id)) continue;
+      this.info.set(id, { mmsi: d.mmsi, by: d.by });
+      if (d.voyage) this.voyages.set(id, d.voyage);
+      if (d.calls) this.calls.set(id, d.calls);
+      this.addPings(id, (d.track || []).map(([t, lat, lon, sog, cog, hdg, nav]) => ({ t, lat, lon, sog, cog, hdg, nav })), true);
     }
-    const at = Date.parse(j.generatedAt) || Date.now(), now = Date.now();
-    const recent = [...this.tracks.values()].filter((tr) => tr.length && now - tr[tr.length - 1].t < 60 * MIN).length;
-    const total = this.fleet.ships.length;
-    if (j.status && j.status !== 'ok' && !recent) { setSource('ais', j.status === 'no-key' ? 'demo' : 'error', `${j.error || 'The last collection failed'}. Ships follow demo itineraries.`, at); return false; }
-    setSource('ais', recent ? 'live' : 'demo', recent
-      ? `${recent} of ${total} ships seen by AIS in the last hour. Positions between collections are estimated from course and speed. The rest follow demo itineraries.`
-      : `None of the ${total} ships was in range of an AIS receiver in the last hour. They follow demo itineraries.`, at);
+    const { live, week, total } = this.counts();
+    if (j.status !== 'ok' && !week) { setSource('ais', j.status === 'no-key' ? 'waiting' : 'error', j.error || 'The last collection failed.', at); return false; }
+    setSource('ais', j.status === 'ok' ? 'live' : 'error',
+      `${j.status === 'ok' ? '' : `${j.error || 'The last collection failed'}. `}${live} of ${total} ships heard in the last hour, ${week} in the last week. AIS is picked up by coastal receivers, so ships far offshore are shown at their last known position until they are heard again.`, at);
+    setSource('voyages', this.voyages.size ? 'live' : 'waiting', this.voyages.size
+      ? `${this.voyages.size} ships have broadcast a destination. The crew types it into the ship's AIS, so it is the ship's own word on where it is going.`
+      : 'No ship has broadcast its destination yet. Ships send it every 6 minutes.', at);
     return true;
   }
+  addPings(id, pings, persist) {
+    let tr = this.tracks.get(id); if (!tr) this.tracks.set(id, tr = []);
+    const have = new Set(tr.map((p) => p.t)); let added = false;
+    for (const p of pings) {
+      if (have.has(p.t) || !(Math.abs(p.lat) <= 90) || !(Math.abs(p.lon) <= 180)) continue;
+      tr.push(p); have.add(p.t); added = true; if (persist) this.record(id, p);
+    }
+    if (added) { tr.sort((a, b) => a.t - b.t); this.portCache.delete(id); }
+  }
+  counts(now = Date.now()) {
+    let live = 0, week = 0;
+    for (const tr of this.tracks.values()) { const t = tr[tr.length - 1]?.t; if (!t) continue; if (now - t < HOUR) live++; if (now - t < 7 * DAY) week++; }
+    return { live, week, total: this.fleet.ships.length };
+  }
+
+  // ---- optional real-time relay ----
   connect() {
     let ws;
-    try { ws = new WebSocket(CONFIG.AIS_PROXY_URL); } catch (e) { setSource('ais', 'error', `Could not open ${CONFIG.AIS_PROXY_URL}: ${e.message}. Showing demo ships.`); return; }
+    try { ws = new WebSocket(CONFIG.AIS_PROXY_URL); } catch (e) { setSource('ais', 'error', `Could not open ${CONFIG.AIS_PROXY_URL}: ${e.message}`); return; }
     this.ws = ws; ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { this.retry = 2000; ws.send(JSON.stringify({ type: 'hello', mmsi: [...this.byMmsi.keys()] })); setSource('ais', 'live', 'Connected. Waiting for the first position reports.'); };
+    ws.onopen = () => { this.retry = 2000; ws.send(JSON.stringify({ type: 'hello', mmsi: [...this.byMmsi.keys()] })); };
     ws.onmessage = (e) => { try { this.ingest(JSON.parse(typeof e.data === 'string' ? e.data : new TextDecoder().decode(e.data))); } catch {} };
-    ws.onclose = () => {
-      setSource('ais', 'error', 'AIS connection closed. Showing demo ships and retrying.');
-      setTimeout(() => this.connect(), this.retry); this.retry = Math.min(this.retry * 2, 60000);
-    };
+    ws.onclose = () => { setTimeout(() => this.connect(), this.retry); this.retry = Math.min(this.retry * 2, 60000); };
     ws.onerror = () => {};
   }
   ingest(m) {
-    if (m.error) { setSource('ais', 'error', `AIS proxy: ${m.error}. Showing demo ships.`); return; }
-    const meta = m.MetaData || {}, mmsi = String(meta.MMSI ?? meta.MMSI_String ?? '');
-    let ship = this.byMmsi.get(mmsi);
-    if (m.MessageType === 'ShipStaticData') {
-      const sd = m.Message?.ShipStaticData || {};
-      ship = ship || this.byImo.get(sd.ImoNumber) || this.byName.get(norm(sd.Name || meta.ShipName));
-      if (ship) this.byMmsi.set(mmsi, ship);
-      return;
-    }
-    if (m.MessageType !== 'PositionReport') return;
-    ship = ship || this.byName.get(norm(meta.ShipName)); if (!ship) return;
-    this.byMmsi.set(mmsi, ship);
-    const pr = m.Message?.PositionReport || {}, lat = pr.Latitude ?? meta.latitude ?? meta.Latitude, lon = pr.Longitude ?? meta.longitude ?? meta.Longitude;
-    if (!(Math.abs(lat) <= 90) || !(Math.abs(lon) <= 180)) return;
-    const t = Date.parse(meta.time_utc || '') || Date.now();
-    const ping = { t, lat, lon, sog: pr.Sog ?? 0, cog: pr.Cog ?? 0, hdg: pr.TrueHeading < 360 ? pr.TrueHeading : (pr.Cog ?? 0) };
-    let tr = this.tracks.get(ship.id); if (!tr) this.tracks.set(ship.id, tr = []);
-    const last = tr[tr.length - 1];
-    if (last && t <= last.t) return;
-    // keep one point every two minutes in history, but always the newest ping
-    if (last && tr.length > 1 && last.t - tr[tr.length - 2].t < 2 * MIN) tr[tr.length - 1] = ping; else { tr.push(ping); this.record(ship.id, ping); }
-    this.lastMsg = Date.now(); this.count++;
-    if (this.count % 25 === 1) setSource('ais', 'live', `${this.tracks.size} ships reporting live. Other ships follow their itineraries.`);
+    const meta = m.MetaData || {}, mmsi = String(meta.MMSI ?? ''); let ship = this.byMmsi.get(mmsi);
+    if (m.MessageType === 'ShipStaticData') { const sd = m.Message?.ShipStaticData || {}; ship = ship || this.byImo.get(sd.ImoNumber); if (ship) this.byMmsi.set(mmsi, ship); return; }
+    if (m.MessageType !== 'PositionReport' || !ship) return;
+    const pr = m.Message?.PositionReport || {}, t = Date.parse(String(meta.time_utc || '').slice(0, 19).replace(' ', 'T') + 'Z') || Date.now();
+    this.addPings(ship.id, [{ t, lat: pr.Latitude, lon: pr.Longitude, sog: pr.Sog ?? 0, cog: pr.Cog ?? 0, hdg: pr.TrueHeading < 360 ? pr.TrueHeading : (pr.Cog ?? 0), nav: pr.NavigationalStatus ?? 15 }], true);
   }
-  // Live or recorded position for a ship at time t, or null when the itinerary should be used instead.
-  positionAt(shipId, t) {
-    const tr = this.tracks.get(shipId); if (!tr || !tr.length) return null;
+
+  // ---- positions ----
+  // Where the ship was at time t according to AIS, or null when AIS has nothing for it.
+  positionAt(id, t) {
+    const tr = this.tracks.get(id); if (!tr || !tr.length || t < tr[0].t) return null;
     let lo = 0, hi = tr.length - 1;
-    if (t < tr[0].t) return null;
     while (lo < hi) { const m = (lo + hi + 1) >> 1; if (tr[m].t <= t) lo = m; else hi = m - 1; }
     const a = tr[lo], b = tr[lo + 1], now = Date.now();
-    if (b) {
-      if (b.t - a.t > 2 * 60 * MIN) return null;          // a gap too long to bridge: use the itinerary
+    if (b && b.t - a.t <= 3 * HOUR) {                                  // between two reports: follow the great circle
       const f = (t - a.t) / (b.t - a.t), p = gcPoint([a.lat, a.lon], [b.lat, b.lon], f);
-      return { lat: p[0], lon: p[1], hdg: a.hdg, sog: a.sog + (b.sog - a.sog) * f, src: now - t < 10 * MIN ? SRC.LIVE : SRC.RECORDED, seen: a.t };
+      return { lat: p[0], lon: p[1], hdg: a.hdg, sog: a.sog + (b.sog - a.sog) * f, cog: a.cog, nav: a.nav, src: now - t < 10 * MIN ? SRC.LIVE : SRC.RECORDED, seen: a.t };
     }
-    const age = t - a.t;
-    if (age > 6 * 60 * MIN) return null;
-    if (age > 45 * MIN) return { lat: a.lat, lon: a.lon, hdg: a.hdg, sog: a.sog, src: SRC.STALE, seen: a.t };
-    const p = destination(a.lat, a.lon, a.cog, a.sog * age / 36e5);     // dead reckoning between pings
-    return { lat: p[0], lon: p[1], hdg: a.hdg, sog: a.sog, src: age > 5 * MIN ? SRC.ESTIMATED : SRC.LIVE, seen: a.t };
+    const age = t - a.t; if (age > 30 * DAY) return null;
+    if (!stopped(a) && age <= 45 * MIN) {                              // shortly after a report: dead reckoning
+      const p = destination(a.lat, a.lon, a.cog, a.sog * age / HOUR);
+      return { lat: p[0], lon: p[1], hdg: a.hdg, sog: a.sog, cog: a.cog, nav: a.nav, src: age <= 5 * MIN ? SRC.LIVE : SRC.ESTIMATED, seen: a.t };
+    }
+    return { lat: a.lat, lon: a.lon, hdg: a.hdg, sog: a.sog, cog: a.cog, nav: a.nav, src: age <= 5 * MIN ? SRC.LIVE : age <= 6 * HOUR ? SRC.RECENT : SRC.LAST, seen: a.t };
   }
-  // Overlay live positions on a demo state buffer. modes[k] says where each ship's position came from.
-  apply(buf, modes, seen, t) {
-    modes.fill(SRC.DEMO);
-    if (!this.tracks.size) return;
+  // The fleet port (index into fleet.portCodes) a stopped ship is lying at, or -1.
+  portIndex(id, p) {
+    if (!stopped(p)) return -1;
+    const c = this.portCache.get(id); if (c && c.seen === p.seen) return c.k;
+    let k = -1, bd = 6;
+    this.fleet.portCodes.forEach((code, i) => { const q = this.fleet.ports[code], d = distNm(p.lat, p.lon, q.lat, q.lon); if (d < bd) { bd = d; k = i; } });
+    this.portCache.set(id, { seen: p.seen, k }); return k;
+  }
+  // Fill a renderer state buffer for time t. modes[k] says how each ship's position is known.
+  apply(buf, modes, seen, t, trailMs) {
+    const step = trailMs / TRAIL;
     this.fleet.ships.forEach((ship, k) => {
-      const p = this.positionAt(ship.id, t); if (!p) return;
-      const b = k * REC; buf[b] = p.lat; buf[b + 1] = p.lon; buf[b + 2] = p.hdg; buf[b + 3] = p.sog; buf[b + 4] = p.sog > 0.5 ? SEA : PORT;
-      for (let j = 0; j < TRAIL; j++) { const q = this.positionAt(ship.id, t - (j + 1) * 12 * MIN) || p; buf[b + 8 + j * 2] = q.lat; buf[b + 9 + j * 2] = q.lon; }
+      const b = k * REC, p = this.positionAt(ship.id, t);
+      if (!p) { buf[b + 4] = 0; modes[k] = SRC.NONE; seen[k] = 0; return; }
+      buf[b] = p.lat; buf[b + 1] = p.lon; buf[b + 2] = p.hdg; buf[b + 3] = p.sog; buf[b + 4] = stopped(p) ? PORT : SEA; buf[b + 5] = p.src; buf[b + 7] = this.portIndex(ship.id, p);
+      for (let j = 0; j < TRAIL; j++) {
+        const q = p.src === SRC.LAST || p.src === SRC.RECENT ? null : this.positionAt(ship.id, t - (j + 1) * step);
+        buf[b + 8 + j * 2] = q ? q.lat : p.lat; buf[b + 9 + j * 2] = q ? q.lon : p.lon;
+      }
       modes[k] = p.src; seen[k] = p.seen;
     });
   }
+  // The track sailed up to time t, as [[lat, lon], ...], for drawing.
+  trackUntil(id, t, since = t - 7 * DAY) { return (this.tracks.get(id) || []).filter((p) => p.t <= t && p.t >= since).map((p) => [p.lat, p.lon]); }
+  sailedNm(id, t, since) { const pts = this.trackUntil(id, t, since); let nm = 0; for (let i = 1; i < pts.length; i++) nm += distNm(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]); return nm; }
+  lastSeen(id) { const tr = this.tracks.get(id); return tr && tr.length ? tr[tr.length - 1].t : 0; }
+
   // ---- history in IndexedDB ----
   openDb() {
     return new Promise((res, rej) => {
-      const rq = indexedDB.open('open-seas', 1);
-      rq.onupgradeneeded = () => rq.result.createObjectStore('pings', { keyPath: ['ship', 't'] });
+      const rq = indexedDB.open('open-seas', 2);
+      rq.onupgradeneeded = () => { const db = rq.result; if (db.objectStoreNames.contains('pings')) db.deleteObjectStore('pings'); db.createObjectStore('pings', { keyPath: ['ship', 't'] }); };
       rq.onsuccess = () => { this.db = rq.result; res(); }; rq.onerror = () => rej(rq.error);
     });
   }
@@ -150,14 +145,14 @@ export class LiveAISAdapter {
   loadRecorded() {
     return new Promise((res) => {
       if (!this.db) return res();
-      const cutoff = Date.now() - 40 * 864e5, store = this.db.transaction('pings', 'readwrite').objectStore('pings');
+      const cutoff = Date.now() - 30 * DAY, store = this.db.transaction('pings', 'readwrite').objectStore('pings'), got = new Map();
       store.openCursor().onsuccess = (e) => {
-        const c = e.target.result; if (!c) return res();
-        const v = c.value;
-        if (v.t < cutoff) c.delete(); else { let tr = this.tracks.get(v.ship); if (!tr) this.tracks.set(v.ship, tr = []); tr.push(v); }
+        const c = e.target.result;
+        if (!c) { for (const [id, list] of got) this.addPings(id, list, false); return res(); }
+        const { ship, ...p } = c.value;
+        if (p.t < cutoff || !this.fleet.byId.has(ship)) c.delete(); else { if (!got.has(ship)) got.set(ship, []); got.get(ship).push(p); }
         c.continue();
       };
     });
   }
 }
-export { buildFleet };
